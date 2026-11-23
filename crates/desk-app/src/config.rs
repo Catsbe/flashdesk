@@ -21,8 +21,12 @@ pub struct AppConfig {
     pub direct_listen_port: u16,
     #[serde(default = "default_fps")]
     pub default_fps: u32,
+    /// Bitrate *ceiling* for the adaptive bitrate controller.
     #[serde(default = "default_bitrate_kbps")]
     pub default_bitrate_kbps: u32,
+    /// Default stream resolution cap by height: 0 = native, 1080, 720.
+    #[serde(default)]
+    pub stream_max_height: u32,
 }
 
 fn default_true() -> bool {
@@ -35,7 +39,17 @@ fn default_fps() -> u32 {
     60
 }
 fn default_bitrate_kbps() -> u32 {
-    2500
+    // Ceiling only: the host's ABR settles below the link capacity on its own (a 5 Mbps relay
+    // ends up around 4 Mbps). Before ABR this had to be 2500 to avoid 500 ms queueing (Pitfall #12).
+    4000
+}
+
+/// Maps a "max height" preset to the orientation-agnostic `(max_long, max_short)` cap.
+pub fn res_cap_for_height(max_height: u32) -> (u32, u32) {
+    match max_height {
+        0 => (0, 0),
+        h => ((h * 16).div_ceil(9), h),
+    }
 }
 
 impl Default for AppConfig {
@@ -51,6 +65,7 @@ impl Default for AppConfig {
             direct_listen_port: default_direct_port(),
             default_fps: default_fps(),
             default_bitrate_kbps: default_bitrate_kbps(),
+            stream_max_height: 0,
         }
     }
 }

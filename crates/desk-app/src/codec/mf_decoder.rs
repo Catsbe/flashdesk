@@ -2,9 +2,10 @@ use crate::codec::mf_common::{
     create_compressed_sample, ensure_com_mta, ensure_mf_startup, guid_eq, pack_u32_pair,
     poll_event_until, read_sample_bytes, unpack_u32_pair,
 };
-use crate::codec::{nv12_to_rgba, DecodedFrame, VideoDecoder};
+use crate::codec::{DecodedPicture, VideoDecoder};
 use anyhow::{Context, Result};
 use protocol::session::VideoCodec;
+use std::time::{Duration, Instant};
 use windows::core::{Interface, GUID, PWSTR, VARIANT};
 use windows::Win32::Media::MediaFoundation::{
     CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
@@ -22,6 +23,15 @@ use windows::Win32::Media::MediaFoundation::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
+/// How long an async decoder may take to deliver the picture for the packet just submitted
+/// before `decode` returns without it. Hardware decoders typically need 1-5 ms; returning early
+/// instead leaves the picture stuck until the *next* packet arrives, which on a static desktop
+/// used to mean up to the 1 s keep-alive refresh.
+const OUTPUT_WAIT: Duration = Duration::from_millis(8);
+/// After this many consecutive waits that time out (decoder genuinely holds a frame until the
+/// next input), stop waiting so we don't burn `OUTPUT_WAIT` on every packet.
+const MAX_OUTPUT_WAIT_MISSES: u32 = 8;
+
 pub struct MfVideoDecoder {
     codec: VideoCodec,
     backend_name: String,
@@ -29,6 +39,9 @@ pub struct MfVideoDecoder {
     event_gen: Option<IMFMediaEventGenerator>,
     is_async: bool,
     pending_need_input: usize,
+    /// Packets submitted whose picture hasn't come out yet (async path bookkeeping).
+    inputs_in_flight: u32,
+    output_wait_misses: u32,
     width: u32,
     height: u32,
     stride: u32,
@@ -124,11 +137,30 @@ impl MfVideoDecoder {
             event_gen,
             is_async,
             pending_need_input: 0,
+            inputs_in_flight: 0,
+            output_wait_misses: 0,
             width,
             height,
             stride,
             ts_counter: 0,
         })
+    }
+
+    /// Handles one async MFT event: counts input requests and harvests ready pictures.
+    fn handle_event(
+        &mut self,
+        ev: &windows::Win32::Media::MediaFoundation::IMFMediaEvent,
+        latest: &mut Option<DecodedPicture>,
+    ) -> Result<()> {
+        let ty = unsafe { ev.GetType()? };
+        if ty == METransformNeedInput.0 as u32 {
+            self.pending_need_input += 1;
+        } else if ty == METransformHaveOutput.0 as u32 {
+            if let Some(pic) = self.pull_output()? {
+                *latest = Some(pic);
+            }
+        }
+        Ok(())
     }
 
     fn refresh_output_type(&mut self) -> Result<()> {
@@ -141,8 +173,8 @@ impl MfVideoDecoder {
         Ok(())
     }
 
-    fn pull_output(&mut self) -> Result<Option<DecodedFrame>> {
-        let mut latest: Option<DecodedFrame> = None;
+    fn pull_output(&mut self) -> Result<Option<DecodedPicture>> {
+        let mut latest: Option<DecodedPicture> = None;
         loop {
             let step = unsafe {
                 let stream_info: MFT_OUTPUT_STREAM_INFO = self.transform.GetOutputStreamInfo(0)?;
@@ -182,15 +214,17 @@ impl MfVideoDecoder {
             match step.0 {
                 Ok(()) => {
                     if let Some(sample) = step.1 {
+                        self.inputs_in_flight = self.inputs_in_flight.saturating_sub(1);
                         if let Ok(nv12) = read_sample_bytes(&sample) {
                             let need = self.stride as usize * self.height as usize * 3 / 2;
                             if self.width > 0 && self.height > 0 && nv12.len() >= need {
-                                let rgba =
-                                    nv12_to_rgba(&nv12, self.width, self.height, self.stride);
-                                latest = Some(DecodedFrame {
+                                // Keep the raw NV12; the caller converts only the newest picture.
+                                latest = Some(DecodedPicture::Nv12 {
                                     width: self.width,
                                     height: self.height,
-                                    rgba,
+                                    stride: self.stride,
+                                    uv_offset: self.stride as usize * self.height as usize,
+                                    data: nv12,
                                 });
                             }
                         }
@@ -225,7 +259,7 @@ impl VideoDecoder for MfVideoDecoder {
         &self.backend_name
     }
 
-    fn decode(&mut self, packet: &[u8]) -> Result<Option<DecodedFrame>> {
+    fn decode(&mut self, packet: &[u8]) -> Result<Option<DecodedPicture>> {
         ensure_com_mta();
         if packet.is_empty() {
             return Ok(None);
@@ -240,78 +274,83 @@ impl VideoDecoder for MfVideoDecoder {
                 .as_ref()
                 .context("async decoder missing event generator")?
                 .clone();
-            let mut latest: Option<DecodedFrame> = None;
+            let mut latest: Option<DecodedPicture> = None;
 
-            let input_deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(120);
+            // 1) Bounded wait for an input slot, harvesting pictures that show up meanwhile.
+            let input_deadline = Instant::now() + Duration::from_millis(120);
             while self.pending_need_input == 0 {
                 let Some(ev) = poll_event_until(&event_gen, input_deadline)? else {
                     anyhow::bail!("MF decoder timed out waiting for input");
                 };
-                let ty = unsafe { ev.GetType()? };
-                if ty == METransformNeedInput.0 as u32 {
-                    self.pending_need_input += 1;
-                } else if ty == METransformHaveOutput.0 as u32 {
-                    if let Some(f) = self.pull_output()? {
-                        latest = Some(f);
-                    }
-                }
+                self.handle_event(&ev, &mut latest)?;
             }
 
             unsafe {
                 self.transform.ProcessInput(0, &sample, 0)?;
             }
             self.pending_need_input -= 1;
+            self.inputs_in_flight = (self.inputs_in_flight + 1).min(8);
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
-            while std::time::Instant::now() < deadline {
-                let ev_res = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) };
-                let ev = match ev_res {
-                    Ok(e) => e,
-                    Err(_) => {
-                        if latest.is_some() {
-                            break;
-                        }
-                        match poll_event_until(&event_gen, deadline)? {
-                            Some(e) => e,
-                            None => break,
-                        }
-                    }
-                };
-                let ty = unsafe { ev.GetType()? };
-                if ty == METransformHaveOutput.0 as u32 {
-                    if let Some(f) = self.pull_output()? {
-                        latest = Some(f);
-                    }
-                } else if ty == METransformNeedInput.0 as u32 {
-                    self.pending_need_input += 1;
-                    // Drain any queued HaveOutput before returning
-                    while let Ok(ev2) = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                        let ty2 = unsafe { ev2.GetType()? };
-                        if ty2 == METransformHaveOutput.0 as u32 {
-                            if let Some(f) = self.pull_output()? {
-                                latest = Some(f);
-                            }
-                        } else if ty2 == METransformNeedInput.0 as u32 {
-                            self.pending_need_input += 1;
-                        }
-                    }
+            // 2) Drain *every* ready event (a single HaveOutput per call used to let a backlog of
+            //    pictures build up), then give the decoder a short, adaptive window to deliver the
+            //    picture for this packet even if it already asked for more input.
+            let wait = if self.output_wait_misses >= MAX_OUTPUT_WAIT_MISSES {
+                Duration::ZERO
+            } else {
+                OUTPUT_WAIT
+            };
+            let soft_deadline = Instant::now() + wait;
+            let hard_deadline = Instant::now() + Duration::from_millis(120);
+            loop {
+                while let Ok(ev) = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                    self.handle_event(&ev, &mut latest)?;
+                }
+                if self.inputs_in_flight == 0 {
                     break;
+                }
+                // Once the decoder wants more input it may legitimately hold this picture until
+                // the next packet: only wait for the short soft window in that case.
+                let deadline = if self.pending_need_input > 0 {
+                    soft_deadline
+                } else {
+                    hard_deadline
+                };
+                if Instant::now() >= deadline {
+                    break;
+                }
+                match poll_event_until(&event_gen, deadline)? {
+                    Some(ev) => self.handle_event(&ev, &mut latest)?,
+                    None => break,
+                }
+            }
+            if !wait.is_zero() {
+                if self.inputs_in_flight == 0 {
+                    self.output_wait_misses = 0;
+                } else {
+                    self.output_wait_misses += 1;
+                    if self.output_wait_misses == MAX_OUTPUT_WAIT_MISSES {
+                        tracing::info!(
+                            "{}: decoder holds pictures until the next packet; disabling output wait",
+                            self.backend_name
+                        );
+                    }
                 }
             }
             Ok(latest)
         } else {
+            let mut drained: Option<DecodedPicture> = None;
             unsafe {
                 match self.transform.ProcessInput(0, &sample, 0) {
                     Ok(()) => {}
                     Err(e) if e.code() == MF_E_NOTACCEPTING => {
-                        let _ = self.pull_output()?;
+                        // Keep (don't drop) the picture that was blocking the input queue.
+                        drained = self.pull_output()?;
                         self.transform.ProcessInput(0, &sample, 0)?;
                     }
                     Err(e) => return Err(e.into()),
                 }
             }
-            self.pull_output()
+            Ok(self.pull_output()?.or(drained))
         }
     }
 }

@@ -9,7 +9,8 @@ use windows::core::{Interface, GUID, PWSTR, VARIANT};
 use windows::Win32::Media::MediaFoundation::{
     eAVEncCommonRateControlMode_CBR, eAVEncH264VProfile_Main, eAVEncH265VProfile_Main_420_8,
     CODECAPI_AVEncCommonMeanBitRate, CODECAPI_AVEncCommonRateControlMode,
-    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncVideoForceKeyFrame,
+    CODECAPI_AVEncMPVDefaultBPictureCount, CODECAPI_AVEncMPVGOPSize,
+    CODECAPI_AVEncVideoForceKeyFrame,
     CODECAPI_AVLowLatencyMode, ICodecAPI, IMFActivate, IMFMediaEventGenerator, IMFMediaType,
     IMFSample, IMFTransform, METransformHaveOutput, METransformNeedInput, MFCreateMediaType,
     MFCreateSample, MFMediaType_Video, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
@@ -24,6 +25,16 @@ use windows::Win32::Media::MediaFoundation::{
     MF_TRANSFORM_ASYNC, MF_TRANSFORM_ASYNC_UNLOCK, MFSampleExtension_CleanPoint,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
+use std::time::{Duration, Instant};
+
+/// How long `encode` waits for the bitstream of the frame it just submitted after the MFT has
+/// already asked for more input. NVENC / QSV / AMF deliver 1080p-2K frames in a few ms; returning
+/// immediately (old behaviour) left every frame one call behind, i.e. a change on an otherwise
+/// static desktop only went out with the next capture (up to the 1 s keep-alive).
+const OUTPUT_WAIT: Duration = Duration::from_millis(10);
+/// Consecutive timed-out waits after which we conclude the MFT holds frames until the next input
+/// and stop waiting (the host's tail-flush frames then push the held frame out).
+const MAX_OUTPUT_WAIT_MISSES: u32 = 8;
 
 pub struct MfVideoEncoder {
     codec: VideoCodec,
@@ -37,6 +48,9 @@ pub struct MfVideoEncoder {
     codec_api: Option<ICodecAPI>,
     is_async: bool,
     pending_need_input: usize,
+    /// Frames submitted whose bitstream hasn't been collected yet (async path bookkeeping).
+    inputs_in_flight: u32,
+    output_wait_misses: u32,
     cached_param_sets: Vec<u8>,
 }
 
@@ -139,8 +153,30 @@ impl MfVideoEncoder {
             codec_api,
             is_async,
             pending_need_input: 0,
+            inputs_in_flight: 0,
+            output_wait_misses: 0,
             cached_param_sets: Vec::new(),
         })
+    }
+
+    /// Handles one async MFT event: counts input requests and collects ready bitstream.
+    fn handle_event(
+        &mut self,
+        ev: &windows::Win32::Media::MediaFoundation::IMFMediaEvent,
+        collected: &mut Vec<u8>,
+        is_keyframe: &mut bool,
+    ) -> Result<()> {
+        let ty = unsafe { ev.GetType()? };
+        if ty == METransformNeedInput.0 as u32 {
+            self.pending_need_input += 1;
+        } else if ty == METransformHaveOutput.0 as u32 {
+            if let Some((bytes, clean)) = self.drain_available_output()? {
+                self.inputs_in_flight = self.inputs_in_flight.saturating_sub(1);
+                collected.extend_from_slice(&bytes);
+                *is_keyframe |= clean;
+            }
+        }
+        Ok(())
     }
 
     fn drain_available_output(&mut self) -> Result<Option<(Vec<u8>, bool)>> {
@@ -253,61 +289,61 @@ impl VideoEncoder for MfVideoEncoder {
                 .context("async MFT missing event generator")?
                 .clone();
 
-            let input_deadline =
-                std::time::Instant::now() + std::time::Duration::from_millis(250);
+            // 1) Bounded wait for an input slot, collecting bitstream that shows up meanwhile.
+            let input_deadline = Instant::now() + Duration::from_millis(250);
             while self.pending_need_input == 0 {
                 let Some(ev) = poll_event_until(&event_gen, input_deadline)? else {
                     anyhow::bail!("MF encoder timed out waiting for input");
                 };
-                let ty = unsafe { ev.GetType()? };
-                if ty == METransformNeedInput.0 as u32 {
-                    self.pending_need_input += 1;
-                } else if ty == METransformHaveOutput.0 as u32 {
-                    if let Some((bytes, clean)) = self.drain_available_output()? {
-                        collected_data.extend_from_slice(&bytes);
-                        is_keyframe |= clean;
-                    }
-                }
+                self.handle_event(&ev, &mut collected_data, &mut is_keyframe)?;
             }
 
             unsafe {
                 self.transform.ProcessInput(0, &sample, 0)?;
             }
             self.pending_need_input -= 1;
+            self.inputs_in_flight = (self.inputs_in_flight + 1).min(8);
 
-            // Pump events until we obtain output for this frame (or non-blocking if buffered)
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-            while collected_data.is_empty() && std::time::Instant::now() < deadline {
-                let Some(ev) = poll_event_until(&event_gen, deadline)? else {
+            // 2) Drain *every* ready event (collecting only one output per call let a backlog
+            //    build up), then give the MFT a short adaptive window to deliver this frame even if
+            //    it already asked for more input. Without NeedInput we keep the old 200 ms cap.
+            let wait = if self.output_wait_misses >= MAX_OUTPUT_WAIT_MISSES {
+                Duration::ZERO
+            } else {
+                OUTPUT_WAIT
+            };
+            let soft_deadline = Instant::now() + wait;
+            let hard_deadline = Instant::now() + Duration::from_millis(200);
+            loop {
+                while let Ok(ev) = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
+                    self.handle_event(&ev, &mut collected_data, &mut is_keyframe)?;
+                }
+                if self.inputs_in_flight == 0 {
                     break;
+                }
+                let deadline = if self.pending_need_input > 0 {
+                    soft_deadline
+                } else {
+                    hard_deadline
                 };
-                let ty = unsafe { ev.GetType()? };
-                if ty == METransformNeedInput.0 as u32 {
-                    self.pending_need_input += 1;
-                    // Drain any non-blocking HaveOutput right after
-                    while let Ok(ev2) = unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
-                        let ty2 = unsafe { ev2.GetType()? };
-                        if ty2 == METransformNeedInput.0 as u32 {
-                            self.pending_need_input += 1;
-                        } else if ty2 == METransformHaveOutput.0 as u32 {
-                            if let Some((bytes, clean)) = self.drain_available_output()? {
-                                collected_data.extend_from_slice(&bytes);
-                                is_keyframe |= clean;
-                            }
-                        }
-                    }
-                    if !collected_data.is_empty() {
-                        break;
-                    }
-                    // If encoder genuinely wants 1 more primed input frame before first output,
-                    // return empty packet this turn so pipeline keeps feeding.
-                    if self.pending_need_input > 0 {
-                        break;
-                    }
-                } else if ty == METransformHaveOutput.0 as u32 {
-                    if let Some((bytes, clean)) = self.drain_available_output()? {
-                        collected_data.extend_from_slice(&bytes);
-                        is_keyframe |= clean;
+                if Instant::now() >= deadline {
+                    break;
+                }
+                match poll_event_until(&event_gen, deadline)? {
+                    Some(ev) => self.handle_event(&ev, &mut collected_data, &mut is_keyframe)?,
+                    None => break,
+                }
+            }
+            if !wait.is_zero() {
+                if self.inputs_in_flight == 0 {
+                    self.output_wait_misses = 0;
+                } else {
+                    self.output_wait_misses += 1;
+                    if self.output_wait_misses == MAX_OUTPUT_WAIT_MISSES {
+                        tracing::info!(
+                            "{}: encoder holds frames until the next input; relying on tail-flush frames",
+                            self.backend_name
+                        );
                     }
                 }
             }
@@ -412,6 +448,13 @@ fn try_init_encoder_mft(
             let _ = api.SetValue(
                 &CODECAPI_AVEncCommonMeanBitRate,
                 &VARIANT::from(bitrate_kbps.saturating_mul(1000)),
+            );
+            // The transport is reliable (TCP): periodic IDRs only cost bandwidth. A 2K IDR is
+            // 100-300 KB, i.e. a 0.2-0.5 s stall on a 5 Mbps link every GOP. Keyframes are still
+            // produced on demand (session start, monitor switch, viewer recovery requests).
+            let _ = api.SetValue(
+                &CODECAPI_AVEncMPVGOPSize,
+                &VARIANT::from(fps.max(1).saturating_mul(600)),
             );
         }
 

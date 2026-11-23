@@ -32,14 +32,22 @@ pub fn poll_event_until(
     event_gen: &IMFMediaEventGenerator,
     deadline: std::time::Instant,
 ) -> Result<Option<IMFMediaEvent>> {
+    // Hardware MFTs usually answer within a few ms: yield-poll for the first 2 ms (a 1 ms sleep
+    // can last a whole 15 ms OS tick on coarse-timer systems), then back off to 1 ms sleeps.
+    let spin_until = std::time::Instant::now() + std::time::Duration::from_millis(2);
     loop {
         match unsafe { event_gen.GetEvent(MF_EVENT_FLAG_NO_WAIT) } {
             Ok(ev) => return Ok(Some(ev)),
             Err(_) => {
-                if std::time::Instant::now() >= deadline {
+                let now = std::time::Instant::now();
+                if now >= deadline {
                     return Ok(None);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                if now < spin_until {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
         }
     }

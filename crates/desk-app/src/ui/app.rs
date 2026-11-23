@@ -123,6 +123,7 @@ impl eframe::App for FlashDeskApp {
                                 self.caps.clone(),
                                 snap.default_fps,
                                 snap.default_bitrate_kbps,
+                                crate::config::res_cap_for_height(snap.stream_max_height),
                                 repaint,
                             );
                             self.active_session = Some((
@@ -130,6 +131,7 @@ impl eframe::App for FlashDeskApp {
                                 RemoteViewState::new(
                                     snap.default_fps,
                                     snap.default_bitrate_kbps,
+                                    snap.stream_max_height,
                                     pref_file_id,
                                 ),
                             ));
@@ -214,6 +216,7 @@ impl eframe::App for FlashDeskApp {
                                     self.caps.clone(),
                                     snap.default_fps,
                                     snap.default_bitrate_kbps,
+                                    crate::config::res_cap_for_height(snap.stream_max_height),
                                     repaint,
                                 );
                                 self.active_session = Some((
@@ -221,6 +224,7 @@ impl eframe::App for FlashDeskApp {
                                     RemoteViewState::new(
                                         snap.default_fps,
                                         snap.default_bitrate_kbps,
+                                        snap.stream_max_height,
                                         pref_file_id,
                                     ),
                                 ));
@@ -238,6 +242,7 @@ impl eframe::App for FlashDeskApp {
                                     self.caps.clone(),
                                     snap.default_fps,
                                     snap.default_bitrate_kbps,
+                                    crate::config::res_cap_for_height(snap.stream_max_height),
                                     repaint,
                                 );
                                 self.active_session = Some((
@@ -245,6 +250,7 @@ impl eframe::App for FlashDeskApp {
                                     RemoteViewState::new(
                                         snap.default_fps,
                                         snap.default_bitrate_kbps,
+                                        snap.stream_max_height,
                                         None,
                                     ),
                                 ));

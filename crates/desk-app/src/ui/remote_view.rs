@@ -31,6 +31,8 @@ pub struct RemoteViewState {
     toolbar_collapsed: bool,
     bitrate_mbps: f32,
     target_fps: u32,
+    /// Resolution cap by height (0 = native, 1080, 720).
+    res_cap_h: u32,
     last_norm_pos: Option<(f32, f32)>,
     prev_mods: Modifiers,
 
@@ -52,6 +54,7 @@ impl RemoteViewState {
     pub fn new(
         initial_fps: u32,
         initial_bitrate_kbps: u32,
+        initial_res_cap_h: u32,
         initial_file_relay_id: Option<String>,
     ) -> Self {
         Self {
@@ -62,6 +65,7 @@ impl RemoteViewState {
             toolbar_collapsed: false,
             bitrate_mbps: (initial_bitrate_kbps as f32 / 1000.0).clamp(1.0, 50.0),
             target_fps: initial_fps,
+            res_cap_h: initial_res_cap_h,
             last_norm_pos: None,
             prev_mods: Modifiers::NONE,
             clipboard_enabled: true,
@@ -99,8 +103,8 @@ pub fn render_remote_view(
     let mut action = RemoteViewAction::None;
 
     if let Some(frame) = session.latest_frame.lock().unwrap().take() {
-        let size = [frame.width as usize, frame.height as usize];
-        let image = ColorImage::from_rgba_unmultiplied(size, &frame.rgba);
+        // Already converted to egui's pixel format on the decode thread: just upload.
+        let image: ColorImage = frame.image;
         match &mut state.texture {
             Some(tex) if state.tex_dims == (frame.width, frame.height) => {
                 tex.set(image, TextureOptions::LINEAR);
@@ -354,6 +358,8 @@ pub fn render_remote_view(
                             }
 
                             ui.separator();
+                            ui.label(RichText::new("码率上限").color(Color32::GRAY))
+                                .on_hover_text("自适应码率不会超过此值；网络变差时自动下调，延迟保持在 100ms 量级");
                             let br_resp = ui.add(
                                 egui::Slider::new(&mut state.bitrate_mbps, 1.0..=50.0)
                                     .suffix("M")
@@ -364,6 +370,25 @@ pub fn render_remote_view(
                                     (state.bitrate_mbps * 1000.0).round() as u32,
                                 ));
                             }
+
+                            let res_label = match state.res_cap_h {
+                                1080 => "1080p",
+                                720 => "720p",
+                                _ => "原始分辨率",
+                            };
+                            egui::ComboBox::from_id_salt("remote_res_cap")
+                                .selected_text(res_label)
+                                .width(92.0)
+                                .show_ui(ui, |ui| {
+                                    for (h, txt) in [(0u32, "原始分辨率"), (1080, "1080p"), (720, "720p")] {
+                                        if ui.selectable_value(&mut state.res_cap_h, h, txt).changed() {
+                                            let (l, s) = crate::config::res_cap_for_height(h);
+                                            session.send(ViewerCommand::SetResolutionCap(l, s));
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("2K/4K 屏走小带宽中转时选 1080p：每帧数据量减半，更流畅");
 
                             if ui.selectable_value(&mut state.target_fps, 30, "30").changed() {
                                 session.send(ViewerCommand::SetFps(30));
@@ -463,6 +488,27 @@ pub fn render_remote_view(
                         .size(12.0)
                         .color(Color32::from_rgb(130, 245, 195)),
                     );
+                    if let Some(host) = hud.host.as_ref().filter(|h| h.flow_control) {
+                        // "画面" = host hand-off -> decoded here (includes all queueing on the path).
+                        ui.label(
+                            RichText::new(format!(
+                                "画面: {} ms (峰值 {}) | 自适应码率: {:.1}/{:.1} Mbps | 解码: {:.1}ms{}",
+                                host.avg_delay_ms,
+                                host.max_delay_ms,
+                                host.sent_kbps as f32 / 1000.0,
+                                host.target_kbps as f32 / 1000.0,
+                                hud.decode_ms,
+                                if host.paused_ticks > 0 {
+                                    format!(" | 限流 {} 帧", host.paused_ticks)
+                                } else {
+                                    String::new()
+                                }
+                            ))
+                            .monospace()
+                            .size(11.0)
+                            .color(Color32::from_rgb(160, 210, 255)),
+                        );
+                    }
                     let codec_disp = if hud.codec_label.is_empty() {
                         "协商中...".into()
                     } else {

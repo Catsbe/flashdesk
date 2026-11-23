@@ -53,3 +53,17 @@ sudo systemctl restart flashdesk-relay
 # 卸载服务
 sudo bash deploy-relay.sh --uninstall
 ```
+
+---
+
+## 四、升级中转二进制（2026-11 低延迟版）
+
+2026-11 起中转端对**控屏/视频通道**改用 32 KB 转发缓冲 + `TCP_NOTSENT_LOWAT`（文件通道仍为 512 KB），配合客户端的帧确认流控把 5M 小水管上的画面延迟压在 ~100 ms 量级。只需替换二进制，配置与部署脚本不变：
+
+```bash
+sudo systemctl stop flashdesk-relay
+sudo install -m 755 flashdesk-relay-linux-x86_64 /opt/flashdesk/flashdesk-relay
+sudo systemctl start flashdesk-relay
+```
+
+> 旧中转端也能和新客户端互通（流控在客户端两端完成），只是中转自身的大缓冲会多藏几百毫秒排队；建议升级。

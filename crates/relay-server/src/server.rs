@@ -17,7 +17,52 @@ use tracing::{debug, info, warn};
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const PRESENCE_IDLE_TIMEOUT: Duration = Duration::from_secs(25);
-const RELAY_COPY_BUF_SIZE: usize = 512 * 1024;
+/// Bulk file tunnels: large buffers for throughput on high-BDP (overseas) links.
+const FILE_COPY_BUF_SIZE: usize = 512 * 1024;
+/// Interactive tunnels (control / video): keep what the relay itself buffers small. On a 5 Mbps
+/// egress the old 512 KB buffer alone held ~0.8 s of video; the host's flow control can only
+/// bound latency if the path doesn't hide a deep queue.
+const INTERACTIVE_COPY_BUF_SIZE: usize = 32 * 1024;
+/// Linux `TCP_NOTSENT_LOWAT` for interactive sockets: a socket only reports writable while less
+/// than this much *unsent* data is queued, so backlog stays in the sender instead of the kernel.
+#[cfg(target_os = "linux")]
+const INTERACTIVE_NOTSENT_LOWAT: i32 = 16 * 1024;
+
+fn copy_buf_size(channel: ChannelKind) -> usize {
+    if channel == ChannelKind::File {
+        FILE_COPY_BUF_SIZE
+    } else {
+        INTERACTIVE_COPY_BUF_SIZE
+    }
+}
+
+/// Low-latency socket options for control / video tunnels.
+fn tune_interactive_socket(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // Value from include/uapi/linux/tcp.h (stable since Linux 3.12).
+        const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+        let val: libc::c_int = INTERACTIVE_NOTSENT_LOWAT;
+        // SAFETY: valid socket fd for the lifetime of `stream`; option value is a c_int.
+        let rc = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                TCP_NOTSENT_LOWAT,
+                std::ptr::addr_of!(val).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            debug!(
+                "TCP_NOTSENT_LOWAT not applied: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
 
 pub async fn run_server(listener: TcpListener, state: Arc<RelayState>) -> anyhow::Result<()> {
     info!("FlashDesk relay listening on {}", listener.local_addr()?);
@@ -73,7 +118,7 @@ async fn handle_connection(
             channel,
         } => {
             if *channel != ChannelKind::File {
-                let _ = stream.set_nodelay(true);
+                tune_interactive_socket(&stream);
             }
             handle_open_session(
                 stream,
@@ -90,7 +135,7 @@ async fn handle_connection(
             channel,
         } => {
             if *channel != ChannelKind::File {
-                let _ = stream.set_nodelay(true);
+                tune_interactive_socket(&stream);
             }
             handle_accept_session(stream, auth_req.cert, *session_id, *channel, state).await
         }
@@ -100,7 +145,7 @@ async fn handle_connection(
             peer_device_id,
         } => {
             if *channel != ChannelKind::File {
-                let _ = stream.set_nodelay(true);
+                tune_interactive_socket(&stream);
             }
             handle_pair_tunnel(
                 stream,
@@ -271,13 +316,8 @@ async fn handle_open_session(
         channel, cert.device_id, target_device_id, session_id
     );
 
-    let _ = copy_bidirectional_with_sizes(
-        &mut stream,
-        &mut target_stream,
-        RELAY_COPY_BUF_SIZE,
-        RELAY_COPY_BUF_SIZE,
-    )
-    .await;
+    let buf = copy_buf_size(channel);
+    let _ = copy_bidirectional_with_sizes(&mut stream, &mut target_stream, buf, buf).await;
 
     Ok(())
 }
@@ -367,13 +407,8 @@ async fn handle_pair_tunnel(
                 "direct pair tunnel {:?}: {} <-> {} (session {})",
                 channel, cert.device_id, peer_device_id, session_id
             );
-            let _ = copy_bidirectional_with_sizes(
-                &mut stream,
-                &mut partner_stream,
-                RELAY_COPY_BUF_SIZE,
-                RELAY_COPY_BUF_SIZE,
-            )
-            .await;
+            let buf = copy_buf_size(channel);
+            let _ = copy_bidirectional_with_sizes(&mut stream, &mut partner_stream, buf, buf).await;
             Ok(())
         }
     }

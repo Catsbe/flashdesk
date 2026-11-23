@@ -13,10 +13,11 @@
   $env:PATH = "D:\Rust\cargo\bin;D:\Rust\mingw64\bin;$env:PATH"
   ```
 - **不要改成 MSVC**（沙箱无提权），也**不要把 `target-dir` 移回中文路径**（MinGW `dlltool`/`objdump` 不兼容中文路径，[.cargo/config.toml](.cargo/config.toml) 已指向 `D:\Rust\target-flashdesk`）。
+- 机器没有 `D:` 数据盘时：同一套工具链装到 `C:\Rust` 之类的纯 ASCII 非用户目录，**不改配置文件**，用 `CARGO_TARGET_DIR` / `CARGO_TARGET_<triple>_LINKER` / `FLASHDESK_MINGW_DIR` 环境变量覆盖（完整命令见架构文档「三、1. 工具链存放红线」）。
 
 ---
 
-## 2. 七条不可打破的架构红线（踩坑血泪总结）
+## 2. 十条不可打破的架构红线（踩坑血泪总结）
 1. **禁止在 GUI 主线程初始化 COM MTA / Media Foundation**：`winit` 依赖 COM STA (`OleInitialize`)，冲突必 panic `RPC_E_CHANGED_MODE`。保留 [crates/desk-app/src/codec/mod.rs](crates/desk-app/src/codec/mod.rs) 中独立线程 `flashdesk-codec-probe` 的隔离机制。
 2. **禁止切换回 `eframe` 的 `wgpu` Vulkan 后端**：双显卡 / Intel 核显 Vulkan (`Unrecognized present mode 1000361000`) 会导致整窗黑白色块撕裂与断开后剧烈闪烁。必须保留 [crates/desk-app/Cargo.toml](crates/desk-app/Cargo.toml) 中的 `features = ["default_fonts", "glow"]`。
 3. **保持单文件零外部 DLL**：保留 [.cargo/config.toml](.cargo/config.toml) `CXXSTDLIB = ""` 与 [crates/desk-app/build.rs](crates/desk-app/build.rs) 静态组链接，每次改动后必须用 `objdump -p` 确认零 `libstdc++-6.dll` / `libwinpthread-1.dll` / `libgcc_s_seh-1.dll`。
@@ -27,6 +28,9 @@
 5. **中转服务端路由与超时顺序不可倒退**：[crates/relay-server/src/state.rs](crates/relay-server/src/state.rs) 必须用 `.rev().find(|e| e.accept_incoming)` 优先投递给最新活跃连接；修改中转端后需重新交叉编译并同步更新 `deploy\flashdesk-relay-linux-x86_64` 与提示用户升级服务端。
 6. **`deploy/deploy-relay.sh` 必须严格保持 LF（0 个 `\r` 字节）**，修改后用 `D:\Git\bin\bash.exe -n` 校验。
 7. **严禁将 `read_frame` / `NoiseReader::recv_msg` 直接放进 `tokio::select!`**：两者均非 cancel-safe，竞争就绪会丢弃半帧 TCP 字节并破坏 Noise nonce（导致键鼠失灵与断线假死）；必须保留独立 reader task + 取消安全 `mpsc::channel` 隔离设计。
+8. **视频背压只能发生在抓屏/编码之前，禁止“编完再丢、丢了补关键帧”**（坑 #16）：被控端先 `video_tx.try_reserve()` + `FlowController::can_send()` 再抓屏编码；主控端解码队列禁止丢帧（`send().await`），积压时批量解码、只转最新一帧；关键帧请求两端都限频 ≥ 1s。否则 5M 中转上必然出现关键帧风暴（2K IDR 100–300 KB）。
+9. **帧确认 `FrameAck` 必须走视频连接的反向**（不走控制通道，否则会排在剪贴板大图/键鼠后面把流控闸门卡死）；`ControlMsg` / 协议枚举的新变体**只能追加到末尾**（bincode 按变体序号编码，`protocol` 有 `control_msg_variant_indices_are_stable` 单测守护）。
+10. **中转端交互通道（Control/Video）保持小缓冲**：`copy_bidirectional` 32 KB + Linux `TCP_NOTSENT_LOWAT` 16 KB；只有 File 通道用 512 KB。改动抓屏/编解码/传输/流控后必须跑 `flashdesk.exe --link-bench`（见第 3 节）。
 
 ---
 
@@ -54,4 +58,7 @@ Pop-Location
 # 4. 无 MinGW 洁净环境验证 GUI 启动与 --self-test
 $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and ($_ -notmatch 'mingw') -and ($_ -notmatch 'Rust\\cargo') }) -join ';'
 Start-Process -FilePath .\target\release\flashdesk.exe -ArgumentList "--self-test" -Wait -PassThru
+
+# 5. 5M 中转端到端基准（真实编解码 + 流控，合成桌面 + 限速代理；退出码 0 = PASS）
+.\target\release\flashdesk.exe --link-bench | Out-String
 ```

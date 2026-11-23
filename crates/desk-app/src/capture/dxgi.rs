@@ -163,15 +163,16 @@ impl DxgiSingleCapturer {
     }
 
     pub fn capture_next(&mut self, timeout_ms: u32, force_frame: bool) -> Result<CaptureOutcome> {
-        match self.acquire_bgra(timeout_ms)? {
-            AcquireState::Updated => {}
+        let content_changed = match self.acquire_bgra(timeout_ms)? {
+            AcquireState::Updated => true,
             AcquireState::Unchanged => {
                 if !force_frame || self.last_bgra.is_empty() {
                     return Ok(CaptureOutcome::Unchanged);
                 }
+                false
             }
             AcquireState::Reacquired => return Ok(CaptureOutcome::Reacquired),
-        }
+        };
 
         let (ew, eh) = self.even_dimensions();
         let nv12 = bgra_to_nv12(&self.last_bgra, self.width, self.height);
@@ -180,6 +181,7 @@ impl DxgiSingleCapturer {
             height: eh,
             nv12,
             timestamp_us: self.start_time.elapsed().as_micros() as u64,
+            content_changed,
         }))
     }
 }
@@ -394,15 +396,16 @@ impl GdiSingleCapturer {
     }
 
     pub fn capture_next(&mut self, force_frame: bool) -> Result<CaptureOutcome> {
-        match self.acquire_bgra()? {
-            AcquireState::Updated => {}
+        let content_changed = match self.acquire_bgra()? {
+            AcquireState::Updated => true,
             AcquireState::Unchanged => {
                 if !force_frame || self.last_bgra.is_empty() {
                     return Ok(CaptureOutcome::Unchanged);
                 }
+                false
             }
             AcquireState::Reacquired => return Ok(CaptureOutcome::Reacquired),
-        }
+        };
 
         let (ew, eh) = self.even_dimensions();
         let nv12 = bgra_to_nv12(&self.last_bgra, self.width, self.height);
@@ -411,6 +414,7 @@ impl GdiSingleCapturer {
             height: eh,
             nv12,
             timestamp_us: self.start_time.elapsed().as_micros() as u64,
+            content_changed,
         }))
     }
 }
@@ -716,6 +720,7 @@ impl CompositeCapturer {
             height: self.canvas_h,
             nv12,
             timestamp_us: self.start_time.elapsed().as_micros() as u64,
+            content_changed: any_updated,
         }))
     }
 }

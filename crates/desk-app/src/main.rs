@@ -7,6 +7,7 @@ mod config;
 mod input;
 mod net;
 mod service;
+mod timing;
 mod transfer;
 mod ui;
 mod vdd;
@@ -74,6 +75,43 @@ struct Cli {
     /// Explicit config path for service / agent / install commands
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Benchmark the real streaming pipeline (encode -> flow control -> Noise -> decode) over a
+    /// simulated bandwidth-limited relay, using a synthetic 60 Hz desktop. Exit code 0 = PASS.
+    #[arg(long)]
+    link_bench: bool,
+    /// --link-bench: bottleneck bandwidth in Mbps
+    #[arg(long, default_value_t = 5.0)]
+    bench_mbps: f64,
+    /// --link-bench: one-way delay in ms (RTT = 2x)
+    #[arg(long, default_value_t = 15)]
+    bench_delay_ms: u64,
+    /// --link-bench: relay buffer depth in ms before the link pushes back
+    #[arg(long, default_value_t = 1000)]
+    bench_queue_ms: u64,
+    /// --link-bench: synthetic desktop size, e.g. 1920x1080 or 2560x1440
+    #[arg(long, default_value = "1920x1080")]
+    bench_res: String,
+    /// --link-bench: frame rate
+    #[arg(long, default_value_t = 60)]
+    bench_fps: u32,
+    /// --link-bench: bitrate ceiling in kbps (the toolbar slider)
+    #[arg(long, default_value_t = 4000)]
+    bench_max_kbps: u32,
+    /// --link-bench: resolution cap by height (0 = native, 1080, 720)
+    #[arg(long, default_value_t = 0)]
+    bench_cap: u32,
+    /// --link-bench: seconds of continuous scrolling
+    #[arg(long, default_value_t = 12)]
+    bench_scroll_secs: u64,
+    /// --link-bench: seconds with a large full-motion video region (saturates the link)
+    #[arg(long, default_value_t = 10)]
+    bench_video_secs: u64,
+    /// --link-bench: seconds of sparse "typing" updates
+    #[arg(long, default_value_t = 8)]
+    bench_typing_secs: u64,
+    /// --link-bench: disable frame acks (emulates the legacy transport for comparison)
+    #[arg(long)]
+    bench_no_ack: bool,
 }
 
 /// Re-attaches stdout/stderr to the caller's terminal for CLI invocations when built with
@@ -185,8 +223,36 @@ fn open_log_file(path: &std::path::Path) -> Option<std::fs::File> {
         .ok()
 }
 
+/// Requests 1 ms timer resolution for this process. Without it `Sleep` / `std::thread::sleep`
+/// round up to the 15.6 ms system tick on many machines (measured on a Win11 VM: a 1 ms sleep
+/// took ~12 ms), which capped the capture loop around 40 fps and slowed the 1 ms MF event
+/// polling. Since Windows 11 the request is per-process and may be dropped for occluded /
+/// minimised window-owning processes unless timer-resolution power throttling is opted out of.
+fn enable_high_resolution_timers() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE,
+    };
+    unsafe {
+        let _ = windows::Win32::Media::timeBeginPeriod(1);
+        let state = PROCESS_POWER_THROTTLING_STATE {
+            Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+            ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: 0,
+        };
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            std::ptr::addr_of!(state).cast(),
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
 fn main() -> Result<()> {
     attach_parent_console_if_needed();
+    enable_high_resolution_timers();
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -194,7 +260,12 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    if cli.install_service
+    if cli.link_bench {
+        if std::env::var_os("RUST_LOG").is_none() {
+            std::env::set_var("RUST_LOG", "warn");
+        }
+        init_logging(None);
+    } else if cli.install_service
         || cli.uninstall_service
         || cli.restart_service
         || cli.sync_service_config
@@ -246,6 +317,31 @@ fn main() -> Result<()> {
     }
     if cli.self_test {
         return run_self_test();
+    }
+    if cli.link_bench {
+        let (bw, bh) = cli
+            .bench_res
+            .split_once(['x', 'X'])
+            .and_then(|(a, b)| Some((a.trim().parse().ok()?, b.trim().parse().ok()?)))
+            .ok_or_else(|| anyhow::anyhow!("--bench-res must look like 1920x1080"))?;
+        let pass = net::bench::run_link_bench(net::bench::BenchConfig {
+            link_mbps: cli.bench_mbps,
+            one_way_ms: cli.bench_delay_ms,
+            queue_ms: cli.bench_queue_ms,
+            width: bw,
+            height: bh,
+            fps: cli.bench_fps,
+            max_kbps: cli.bench_max_kbps,
+            res_cap_h: cli.bench_cap,
+            scroll_secs: cli.bench_scroll_secs,
+            video_secs: cli.bench_video_secs,
+            typing_secs: cli.bench_typing_secs,
+            no_ack: cli.bench_no_ack,
+        })?;
+        if !pass {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     let cfg_path = cli.config.unwrap_or_else(AppConfig::resolve_path);
@@ -536,6 +632,7 @@ fn generate_synthetic_nv12_frames(w: u32, h: u32, count: usize) -> (Vec<RawFrame
             height: h,
             nv12,
             timestamp_us: (idx as u64) * 16_667,
+            content_changed: true,
         });
     }
 
@@ -560,10 +657,12 @@ fn verify_codec_pipeline(
 
         if !pkt.data.is_empty() {
             let t1 = Instant::now();
-            if let Some(df) = dec.decode(&pkt.data)? {
+            if let Some(pic) = dec.decode(&pkt.data)? {
+                let (pw, ph) = pic.dimensions();
+                let rgba = pic.to_rgba();
                 dec_us_sum += t1.elapsed().as_micros();
-                anyhow::ensure!(df.width > 0 && df.height > 0);
-                anyhow::ensure!(df.rgba.len() == (df.width * df.height * 4) as usize);
+                anyhow::ensure!(pw > 0 && ph > 0);
+                anyhow::ensure!(rgba.len() == (pw * ph * 4) as usize);
                 decoded_ok += 1;
             }
         }

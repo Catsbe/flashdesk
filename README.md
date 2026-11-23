@@ -22,6 +22,9 @@
 - **画面链路**：DXGI `DuplicateOutput1 → DuplicateOutput → GDI BitBlt` 三层抓屏降级；
   MF 硬件 HEVC / H.264 低延迟 CBR + OpenH264 软编回退（运行时热切换）；异步 MFT 全超时轮询杜绝死等。
 - **60fps 体验**：首帧预热 + 1s 保活刷新、静止桌面不黑屏、切屏/分辨率变化自动重建编码器。
+- **小水管不卡**：帧确认驱动的延迟闸门 + 自适应码率（5M 中转上画面延迟稳定在 ~100 ms 量级，不再堆积到秒级）；
+  编码前背压、关键帧限频、变化后冲刷编解码器憋帧；抓屏/编码流水线 + 精确节拍；可选 1080p/720p 分辨率上限；
+  `flashdesk.exe --link-bench` 端到端基准（合成桌面 + 限速中转代理）。
 - **文件传输**：256 KiB 分块、`.fdesk.part/.fdesk.meta` 断点续传、SHA-256 校验、双栏拖拽上传。
 - **双向剪贴板**（文本 + ≤8 MiB 图片，序列号防回环）、**虚拟显示器**（Parsec VDD / OrayIddDriver 检测与增删）。
 - **eframe + glow(OpenGL)** 渲染：兼容独显 / 核显 / 虚拟机，无 Vulkan 花屏问题；单文件零外部 MinGW DLL。
@@ -74,8 +77,12 @@ cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 2026-11-23 真机（域管办公机，双 2K 屏 + NVIDIA 硬编）：16/16 单元与集成测试、PE 零 MinGW DLL 审计、
 洁净环境 `--self-test` 全链路通过；服务 agent 以 SYSTEM 拉起并持有直连端口，主控端反复连接 / 锁屏场景初测联通。
 
+2026-11-23 低延迟传输改造（Pitfall #16，4 vCPU 虚拟机 + OpenH264 软编）：38/38 测试、PE 零 MinGW DLL、
+洁净环境 `--self-test` 通过；`--link-bench` 模拟国内 5M 中转：1080p 滚动 56–60 fps、画面延迟 p95 ≈ 60 ms，
+2K + 1080p 上限 59.7 fps；拥塞对照中画面延迟从关闭帧确认时的 ~2 s 降到 ~0.2 s。真机硬编环境尚待实测。
+
 ## 文档
 
-- [AGENTS.md](AGENTS.md) — 接手速查红线（工具链、七条架构红线、验收命令）
-- [docs/ARCHITECTURE_AND_PITFALLS.md](docs/ARCHITECTURE_AND_PITFALLS.md) — 完整架构与 Pitfalls #1–#15
+- [AGENTS.md](AGENTS.md) — 接手速查红线（工具链、十条架构红线、验收命令）
+- [docs/ARCHITECTURE_AND_PITFALLS.md](docs/ARCHITECTURE_AND_PITFALLS.md) — 完整架构与 Pitfalls #1–#16
 - [deploy/README.md](deploy/README.md) — Ubuntu 中转部署与运维

@@ -351,6 +351,7 @@ async fn run_presence_once(
                                     agent_mode,
                                     auto_vdd_on_headless: auto_vdd,
                                     pending_channels: Arc::clone(&pending),
+                                    frame_source: None,
                                 };
                                 if let Err(e) = run_host_session(ctrl, video, opts).await {
                                     tracing::warn!("host session ended with error: {e:#}");

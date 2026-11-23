@@ -431,13 +431,25 @@ pub fn render_settings(
                     changed = true;
                 }
                 ui.separator();
-                ui.label("默认码率 (kbps):");
+                ui.label("码率上限 (kbps):")
+                    .on_hover_text("自适应码率的上限；网络变差时会自动下调");
                 if ui
                     .add(egui::Slider::new(&mut c.default_bitrate_kbps, 1000..=50_000))
                     .changed()
                 {
                     changed = true;
                 }
+            });
+            ui.horizontal(|ui| {
+                ui.label("默认分辨率上限:");
+                for (h, txt) in [(0u32, "原始"), (1080, "1080p"), (720, "720p")] {
+                    if ui.selectable_value(&mut c.stream_max_height, h, txt).changed() {
+                        changed = true;
+                    }
+                }
+                ui.label(
+                    RichText::new("（2K/4K 屏走 5M 小带宽中转建议 1080p）").color(Color32::GRAY),
+                );
             });
 
             let relay_list = c

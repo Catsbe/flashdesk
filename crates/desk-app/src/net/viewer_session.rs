@@ -1,19 +1,38 @@
 use crate::clipboard::ClipboardSync;
-use crate::codec::{create_decoder, CodecCapabilities, DecodedFrame};
+use crate::codec::{create_decoder, CodecCapabilities, DecodedPicture};
 use crate::net::connect_and_auth_relay;
 use crate::net::direct::connect_direct_channel;
 use crate::transfer::client_manager::{spawn_file_client, FileClientHandle, FileCommand, FileTransportMode};
 use anyhow::Result;
+use eframe::egui::{Color32, ColorImage};
 use protocol::auth::{DeviceBundle, RelayNodeConfig};
 use protocol::noise::NoiseStream;
 use protocol::relay::{ChannelKind, ConnectionPurpose};
-use protocol::session::{ControlMsg, InputEvent, MonitorInfo, VddInfo, VddRequest, VideoCodec, VideoFrame};
+use protocol::session::{
+    ControlMsg, HostStreamStats, InputEvent, MonitorInfo, VddInfo, VddRequest, VideoCodec,
+    VideoFrame,
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+/// Keyframe requests (decode errors, first-frame stall) are sent at most this often. The old
+/// code requested one per dropped frame, which turned congestion into an IDR storm.
+const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+/// Decoder input queue. Frames are never dropped here: when full, the network reader waits,
+/// acks stop, and the host's flow control pauses capture instead.
+const DECODE_QUEUE: usize = 8;
+
+static FRAME_ACKS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Benchmark hook (`--link-bench --bench-no-ack`): behave like a viewer that predates flow
+/// control, to compare against the legacy transport behaviour.
+pub fn set_frame_acks_disabled(disabled: bool) {
+    FRAME_ACKS_DISABLED.store(disabled, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct HudStats {
@@ -26,6 +45,17 @@ pub struct HudStats {
     pub relay_name: String,
     pub connecting: bool,
     pub status_notice: Option<String>,
+    /// Mean viewer-side decode + colour conversion time per frame.
+    pub decode_ms: f32,
+    /// Host flow-control / ABR telemetry (absent with hosts that predate it).
+    pub host: Option<HostStreamStats>,
+}
+
+/// Newest decoded remote picture, already in the texture format egui uploads.
+pub struct RemoteFrame {
+    pub width: u32,
+    pub height: u32,
+    pub image: ColorImage,
 }
 
 pub enum ViewerCommand {
@@ -33,6 +63,8 @@ pub enum ViewerCommand {
     SetMonitor(u32),
     SetBitrate(u32),
     SetFps(u32),
+    /// `(max_long, max_short)`, `(0, 0)` = native resolution.
+    SetResolutionCap(u32, u32),
     SetClipboardEnabled(bool),
     VddAction(VddRequest),
     Disconnect,
@@ -52,7 +84,7 @@ pub struct ViewerSessionHandle {
     pub peer_name: String,
     pub via_label: String,
     pub reconnect_target: ReconnectTarget,
-    pub latest_frame: Arc<Mutex<Option<DecodedFrame>>>,
+    pub latest_frame: Arc<Mutex<Option<RemoteFrame>>>,
     pub hud: Arc<Mutex<HudStats>>,
     pub remote_monitors: Arc<Mutex<Vec<MonitorInfo>>>,
     pub active_monitor: Arc<Mutex<u32>>,
@@ -85,6 +117,7 @@ pub fn start_relay_viewer_session(
     local_caps: CodecCapabilities,
     initial_fps: u32,
     initial_bitrate_kbps: u32,
+    initial_res_cap: (u32, u32),
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> ViewerSessionHandle {
     let via_label = format!("中转: {}", ctrl_relay.name);
@@ -170,8 +203,11 @@ pub fn start_relay_viewer_session(
                     ctrl,
                     video,
                     local_caps,
-                    initial_fps,
-                    initial_bitrate_kbps,
+                    StreamRequest {
+                        fps: initial_fps,
+                        bitrate_kbps: initial_bitrate_kbps,
+                        res_cap: initial_res_cap,
+                    },
                     inner.clone(),
                     ctrl_out_tx,
                     ctrl_out_rx,
@@ -204,6 +240,7 @@ pub fn start_direct_viewer_session(
     local_caps: CodecCapabilities,
     initial_fps: u32,
     initial_bitrate_kbps: u32,
+    initial_res_cap: (u32, u32),
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> ViewerSessionHandle {
     let via_label = format!("直连: {direct_addr}");
@@ -264,8 +301,11 @@ pub fn start_direct_viewer_session(
                     ctrl,
                     video,
                     local_caps,
-                    initial_fps,
-                    initial_bitrate_kbps,
+                    StreamRequest {
+                        fps: initial_fps,
+                        bitrate_kbps: initial_bitrate_kbps,
+                        res_cap: initial_res_cap,
+                    },
                     inner.clone(),
                     ctrl_out_tx,
                     ctrl_out_rx,
@@ -324,19 +364,49 @@ fn build_handle(
     (handle, cmd_rx)
 }
 
+/// Initial stream parameters requested by the viewer.
+struct StreamRequest {
+    fps: u32,
+    bitrate_kbps: u32,
+    res_cap: (u32, u32),
+}
+
+/// Converts the newest decoded picture straight into an egui `ColorImage` (one pass, off the UI
+/// thread; the UI only uploads it).
+fn picture_to_frame(mut pic: DecodedPicture, vf: &VideoFrame) -> RemoteFrame {
+    // Decoders often report the 16-aligned coded size (1920x1088 for 1080p): crop the padding,
+    // but only when the difference really is alignment padding (not a resolution switch).
+    let (pw, ph) = pic.dimensions();
+    if pw >= vf.width && ph >= vf.height && pw - vf.width < 16 && ph - vf.height < 16 {
+        pic.crop_to(vf.width, vf.height);
+    }
+    let (w, h) = pic.dimensions();
+    let mut image = ColorImage::new([w as usize, h as usize], Color32::BLACK);
+    pic.write_rgba(bytemuck::cast_slice_mut(&mut image.pixels));
+    RemoteFrame {
+        width: w,
+        height: h,
+        image,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     mut ctrl: NoiseStream<S>,
     video: NoiseStream<S>,
     local_caps: CodecCapabilities,
-    mut target_fps: u32,
-    mut bitrate_kbps: u32,
+    request: StreamRequest,
     handle: ViewerSessionHandle,
     ctrl_out_tx: mpsc::Sender<ControlMsg>,
     mut ctrl_out_rx: mpsc::Receiver<ControlMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<ViewerCommand>,
     repaint: Arc<dyn Fn() + Send + Sync>,
 ) -> Result<()> {
+    let StreamRequest {
+        fps: mut target_fps,
+        mut bitrate_kbps,
+        res_cap,
+    } = request;
     let hello_raw = tokio::time::timeout(Duration::from_secs(10), ctrl.recv_msg())
         .await
         .map_err(|_| anyhow::anyhow!("等待远程主机 Hello 响应超时"))??;
@@ -370,14 +440,25 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         monitor_index: cur_monitor,
     };
     ctrl.send_msg(&bincode::serialize(&start_msg)?).await?;
+    if res_cap != (0, 0) {
+        // Older hosts can't decode this message and simply skip it.
+        let cap = ControlMsg::SetResolutionCap {
+            max_long: res_cap.0,
+            max_short: res_cap.1,
+        };
+        ctrl.send_msg(&bincode::serialize(&cap)?).await?;
+    }
     handle.hud.lock().unwrap().codec_label = format!("{} (等待首帧...)", chosen_codec.label());
     repaint();
 
     let (mut ctrl_reader, mut ctrl_writer, _) = ctrl.into_split();
-    let (mut video_reader, _video_writer, _) = video.into_split();
+    let (mut video_reader, mut video_writer, _) = video.into_split();
 
     let stop_flag = Arc::new(AtomicBool::new(false));
-    let (decode_tx, mut decode_rx) = mpsc::channel::<VideoFrame>(8);
+    let (decode_tx, mut decode_rx) = mpsc::channel::<(VideoFrame, Instant)>(DECODE_QUEUE);
+    // Set once the host advertises flow control (first HostStats); legacy hosts never read acks.
+    let flow_enabled = Arc::new(AtomicBool::new(false));
+    let (ack_tx, mut ack_rx) = mpsc::channel::<ControlMsg>(64);
 
     // Bidirectional clipboard sync
     let clipboard_sync = ClipboardSync::with_enabled_flag(Arc::clone(&handle.clipboard_enabled));
@@ -393,6 +474,7 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let dec_stop = Arc::clone(&stop_flag);
     let dec_repaint = Arc::clone(&repaint);
     let dec_ctrl_tx = ctrl_out_tx.clone();
+    let dec_flow_enabled = Arc::clone(&flow_enabled);
 
     let decode_thread = std::thread::Builder::new()
         .name("flashdesk-viewer-decode".into())
@@ -410,50 +492,90 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
             let mut frames_in_window = 0u32;
             let mut bytes_in_window = 0usize;
+            let mut busy_in_window = Duration::ZERO;
             let mut window_start = Instant::now();
+            let session_start = Instant::now();
             let mut has_decoded_any = false;
             let mut stall_kf_sent = false;
+            let mut last_kf_request: Option<Instant> = None;
+            let mut request_keyframe = |reason: &str| {
+                if last_kf_request.is_none_or(|t| t.elapsed() >= KEYFRAME_REQUEST_MIN_INTERVAL) {
+                    last_kf_request = Some(Instant::now());
+                    tracing::warn!("{reason}; requesting keyframe");
+                    let _ = dec_ctrl_tx.try_send(ControlMsg::RequestKeyframe);
+                }
+            };
 
-            while let Some(vf) = decode_rx.blocking_recv() {
+            while let Some(first) = decode_rx.blocking_recv() {
                 if dec_stop.load(Ordering::Relaxed) {
                     break;
                 }
-                bytes_in_window += vf.data.len();
-
-                match decoder.decode(&vf.data) {
-                    Ok(Some(decoded)) => {
-                        has_decoded_any = true;
-                        frames_in_window += 1;
-                        *dec_handle.latest_frame.lock().unwrap() = Some(decoded);
-                        {
-                            let mut hud = dec_handle.hud.lock().unwrap();
-                            hud.connecting = false;
-                            hud.encode_us = vf.encode_us;
-                            hud.remote_res = format!("{}x{}", vf.width, vf.height);
-                            hud.codec_label =
-                                format!("{} | {}", vf.codec.label(), vf.encoder_name);
-                        }
-                        dec_repaint();
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!("decode failed: {e}, requesting keyframe");
-                        let _ = dec_ctrl_tx.try_send(ControlMsg::RequestKeyframe);
+                let busy_start = Instant::now();
+                // Take everything already queued: every packet must be decoded (reference
+                // chain), but only the newest picture is converted and shown.
+                let mut batch = vec![first];
+                while let Ok(more) = decode_rx.try_recv() {
+                    batch.push(more);
+                }
+                let mut newest: Option<DecodedPicture> = None;
+                for (vf, _) in &batch {
+                    bytes_in_window += vf.data.len();
+                    frames_in_window += 1;
+                    match decoder.decode(&vf.data) {
+                        Ok(Some(pic)) => newest = Some(pic),
+                        Ok(None) => {}
+                        Err(e) => request_keyframe(&format!("decode failed: {e}")),
                     }
                 }
+                let (last_vf, last_recv) = batch.last().expect("batch is never empty");
 
-                let elapsed = window_start.elapsed();
-                if !has_decoded_any && !stall_kf_sent && elapsed >= Duration::from_secs(2) {
+                if let Some(pic) = newest {
+                    let frame = picture_to_frame(pic, last_vf);
+                    let res = format!("{}x{}", frame.width, frame.height);
+                    *dec_handle.latest_frame.lock().unwrap() = Some(frame);
+                    has_decoded_any = true;
+                    {
+                        let mut hud = dec_handle.hud.lock().unwrap();
+                        hud.connecting = false;
+                        hud.encode_us = last_vf.encode_us;
+                        hud.remote_res = res;
+                        hud.codec_label =
+                            format!("{} | {}", last_vf.codec.label(), last_vf.encoder_name);
+                    }
+                    dec_repaint();
+                }
+
+                // Cumulative ack for the whole batch, sent once the newest picture is ready.
+                if dec_flow_enabled.load(Ordering::Relaxed)
+                    && !FRAME_ACKS_DISABLED.load(Ordering::Relaxed)
+                {
+                    let viewer_us = last_recv.elapsed().as_micros().min(u32::MAX as u128) as u32;
+                    let _ = ack_tx.try_send(ControlMsg::FrameAck {
+                        frame_id: last_vf.frame_id,
+                        viewer_us,
+                    });
+                }
+                busy_in_window += busy_start.elapsed();
+
+                if !has_decoded_any && !stall_kf_sent && session_start.elapsed() >= Duration::from_secs(2)
+                {
                     stall_kf_sent = true;
-                    let _ = dec_ctrl_tx.try_send(ControlMsg::RequestKeyframe);
+                    request_keyframe("no picture decoded within 2 s");
                 }
+                let elapsed = window_start.elapsed();
                 if elapsed >= Duration::from_secs(1) {
                     let secs = elapsed.as_secs_f32();
                     let mut hud = dec_handle.hud.lock().unwrap();
                     hud.fps = frames_in_window as f32 / secs;
                     hud.bitrate_mbps = (bytes_in_window as f32 * 8.0) / (secs * 1_000_000.0);
+                    hud.decode_ms = if frames_in_window > 0 {
+                        busy_in_window.as_secs_f32() * 1000.0 / frames_in_window as f32
+                    } else {
+                        0.0
+                    };
                     frames_in_window = 0;
                     bytes_in_window = 0;
+                    busy_in_window = Duration::ZERO;
                     window_start = Instant::now();
                     drop(hud);
                     dec_repaint();
@@ -465,7 +587,6 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     let vr_stop = Arc::clone(&stop_flag);
     let vr_notify = Arc::clone(&ended_notify);
-    let vr_ctrl = ctrl_out_tx.clone();
     let video_recv_task = tokio::spawn(async move {
         loop {
             let raw = match video_reader.recv_msg().await {
@@ -475,16 +596,27 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let Ok(vf) = bincode::deserialize::<VideoFrame>(&raw) else {
                 continue;
             };
-            match decode_tx.try_send(vf) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    let _ = vr_ctrl.try_send(ControlMsg::RequestKeyframe);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            // Never drop: a dropped P-frame corrupts the picture until the next keyframe. If the
+            // decoder is behind we wait here; acks stop and the host pauses capture instead.
+            if decode_tx.send((vf, Instant::now())).await.is_err() {
+                break;
             }
         }
         vr_stop.store(true, Ordering::Relaxed);
         vr_notify.notify_waiters();
+    });
+
+    // Acks ride the otherwise idle viewer->host direction of the video connection so they never
+    // wait behind clipboard images or input on the control channel.
+    let video_ack_task = tokio::spawn(async move {
+        while let Some(msg) = ack_rx.recv().await {
+            let Ok(bytes) = bincode::serialize(&msg) else {
+                continue;
+            };
+            if video_writer.send_msg(&bytes).await.is_err() {
+                break;
+            }
+        }
     });
 
     let cw_stop = Arc::clone(&stop_flag);
@@ -572,6 +704,12 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                             monitor_index: cur_monitor,
                         });
                     }
+                    Some(ViewerCommand::SetResolutionCap(max_long, max_short)) => {
+                        let _ = ctrl_out_tx.try_send(ControlMsg::SetResolutionCap {
+                            max_long,
+                            max_short,
+                        });
+                    }
                     Some(ViewerCommand::SetClipboardEnabled(_)) => {}
                     Some(ViewerCommand::VddAction(req)) => {
                         let _ = ctrl_out_tx.try_send(ControlMsg::VddAction(req));
@@ -594,6 +732,11 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                     hud.rtt_ms = rtt;
                                     hud.encode_us = encode_us;
                                     drop(hud);
+                                    repaint();
+                                }
+                                ControlMsg::HostStats(stats) => {
+                                    flow_enabled.store(true, Ordering::Relaxed);
+                                    handle.hud.lock().unwrap().host = Some(stats);
                                     repaint();
                                 }
                                 ControlMsg::Notice(txt) => {
@@ -645,6 +788,7 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     handle.file_client.send(FileCommand::Shutdown);
     ctrl_read_task.abort();
     video_recv_task.abort();
+    video_ack_task.abort();
     ctrl_write_task.abort();
     let _ = video_recv_task.await;
     drop(ctrl_in_rx);
@@ -655,3 +799,4 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     .await;
     Ok(())
 }
+

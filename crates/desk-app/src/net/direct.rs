@@ -36,6 +36,43 @@ pub async fn connect_direct_channel(
     Ok(stream)
 }
 
+/// Serves one accepted direct (LAN / IP) connection: channel header, Noise responder handshake,
+/// then file-channel hand-off or Control+Video pairing into a host session.
+pub async fn serve_direct_connection(mut stream: TcpStream, opts: HostSessionOptions) {
+    let _ = stream.set_nodelay(true);
+    let Ok(Ok(raw)) = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await
+    else {
+        return;
+    };
+    let Ok(hdr) = bincode::deserialize::<DirectChannelHeader>(&raw) else {
+        return;
+    };
+    let Ok(ns) = NoiseStream::handshake_responder(
+        stream,
+        &opts.bundle.root_pubkey,
+        &opts.bundle.identity,
+        &opts.revoked_ids,
+    )
+    .await
+    else {
+        return;
+    };
+
+    if hdr.channel == ChannelKind::File {
+        opts.pending_channels.fulfill_direct_file(hdr.session_id, ns);
+        return;
+    }
+
+    if let Some((ctrl, video)) = opts
+        .pending_channels
+        .insert_channel(hdr.session_id, hdr.channel, ns)
+    {
+        if let Err(e) = run_host_session(ctrl, video, opts).await {
+            tracing::warn!("direct host session ended with error: {e:#}");
+        }
+    }
+}
+
 pub fn spawn_direct_listener(
     cfg: Arc<Mutex<AppConfig>>,
     caps: CodecCapabilities,
@@ -86,57 +123,24 @@ pub fn spawn_direct_listener(
             loop {
                 tokio::select! {
                     acc = listener.accept() => {
-                        let Ok((mut stream, _peer)) = acc else { break };
-                        let _ = stream.set_nodelay(true);
+                        let Ok((stream, _peer)) = acc else { break };
                         let cfg_snap = cfg.lock().unwrap().clone();
-                        let pending = Arc::clone(&pending);
-                        let caps = caps.clone();
-
-                        tokio::spawn(async move {
-                            if !cfg_snap.allow_incoming {
-                                return;
-                            }
-                            let Some(bundle) = cfg_snap.bundle else {
-                                return;
-                            };
-                            let Ok(Ok(raw)) =
-                                tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await
-                            else {
-                                return;
-                            };
-                            let Ok(hdr) = bincode::deserialize::<DirectChannelHeader>(&raw) else {
-                                return;
-                            };
-                            let Ok(ns) = NoiseStream::handshake_responder(
-                                stream,
-                                &bundle.root_pubkey,
-                                &bundle.identity,
-                                &cfg_snap.revoked_device_ids,
-                            )
-                            .await
-                            else {
-                                return;
-                            };
-
-                            if hdr.channel == ChannelKind::File {
-                                pending.fulfill_direct_file(hdr.session_id, ns);
-                                return;
-                            }
-
-                            if let Some((ctrl, video)) =
-                                pending.insert_channel(hdr.session_id, hdr.channel, ns)
-                            {
-                                let opts = HostSessionOptions {
-                                    caps,
-                                    bundle,
-                                    revoked_ids: cfg_snap.revoked_device_ids,
-                                    agent_mode,
-                                    auto_vdd_on_headless: cfg_snap.auto_vdd_on_headless,
-                                    pending_channels: Arc::clone(&pending),
-                                };
-                                let _ = run_host_session(ctrl, video, opts).await;
-                            }
-                        });
+                        if !cfg_snap.allow_incoming {
+                            continue;
+                        }
+                        let Some(bundle) = cfg_snap.bundle else {
+                            continue;
+                        };
+                        let opts = HostSessionOptions {
+                            caps: caps.clone(),
+                            bundle,
+                            revoked_ids: cfg_snap.revoked_device_ids,
+                            agent_mode,
+                            auto_vdd_on_headless: cfg_snap.auto_vdd_on_headless,
+                            pending_channels: Arc::clone(&pending),
+                            frame_source: None,
+                        };
+                        tokio::spawn(serve_direct_connection(stream, opts));
                     }
                     _ = health_tick.tick() => {
                         let cur_port = cfg.lock().unwrap().direct_listen_port;

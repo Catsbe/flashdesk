@@ -1,4 +1,6 @@
+pub mod bench;
 pub mod direct;
+pub mod flow;
 pub mod host_session;
 pub mod relay_client;
 pub mod viewer_session;

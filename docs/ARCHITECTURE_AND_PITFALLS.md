@@ -89,9 +89,11 @@ e:\Antigravity项目\自用远程软件\
             ├── net\                    # 会话网络层
             │   ├── mod.rs              # connect_and_auth_relay 握手
             │   ├── relay_client.rs     # Presence 保活与 IncomingChannel 分派（10s Noise 握手超时）
-            │   ├── host_session.rs     # 被控端推流、6 帧首帧预热、1s 保活刷新、H.264 异常切 OpenH264、非阻塞退出
-            │   ├── viewer_session.rs   # 主控端双通道发起、解码渲染反馈、首帧卡死重请关键帧、非阻塞退出
-            │   └── direct.rs           # TCP 19444 局域网直连监听与通道分流
+            │   ├── host_session.rs     # 被控端推流：编码前背压、关键帧限频、尾帧冲刷、分辨率上限、HostStats；H.264 异常切 OpenH264
+            │   ├── flow.rs             # 帧确认驱动的延迟闸门（AIMD 在途窗口 + ProbeRTT）与自适应码率（ABR），含 5M 链路仿真单测
+            │   ├── viewer_session.rs   # 主控端：解码队列不丢帧、批量解码只转最新帧、FrameAck（视频通道反向）、关键帧请求限频
+            │   ├── bench.rs            # --link-bench：合成桌面 + 限速中转代理的端到端基准（标记块测“抓屏→解码”延迟）
+            │   └── direct.rs           # TCP 19444 局域网直连监听与通道分流（serve_direct_connection 供基准复用）
             └── ui\                     # egui 界面层
                 ├── fonts.rs            # C:\Windows\Fonts\msyh.ttc 中文字体加载与暗色主题
                 ├── app.rs              # 主窗口切换、配置保存热重载、热切中转节点
@@ -133,9 +135,19 @@ $env:CARGO_HOME = "D:\Rust\cargo"
 $env:PATH = "D:\Rust\cargo\bin;D:\Rust\mingw64\bin;$env:PATH"
 ```
 
+**没有 `D:` 数据盘的机器**（例如 `D:` 是光驱的虚拟机）：把同一套工具链（Rust 1.100.0 GNU + musl 目标、WinLibs GCC 16.2.0 **MSVCRT** 版）装到任意纯 ASCII 非用户目录（如 `C:\Rust`），**不要改 `.cargo/config.toml`**，用环境变量覆盖即可（环境变量优先级高于配置文件）：
+```powershell
+$env:RUSTUP_HOME = "C:\Rust\rustup"; $env:CARGO_HOME = "C:\Rust\cargo"
+$env:PATH = "C:\Rust\cargo\bin;C:\Rust\mingw64\bin;$env:PATH"
+$env:CARGO_TARGET_DIR = "C:\Rust\target-flashdesk"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "C:\Rust\mingw64\bin\x86_64-w64-mingw32-g++.exe"
+$env:CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "C:\Rust\rustup\toolchains\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\rust-lld.exe"
+$env:FLASHDESK_MINGW_DIR = "C:\Rust\mingw64"   # build.rs 的静态库搜索路径（默认 D:\Rust\mingw64）
+```
+
 ### 2. 全量测试与双平台 Release 编译命令
 ```powershell
-# 1) 运行全部 14 项单元与集成测试（desk-app 5 + protocol 4 + relay_e2e 5）
+# 1) 运行全部单元与集成测试（desk-app 25 + protocol 6 + relay_e2e 5 = 36 项，含 flow.rs 的 5M 链路仿真）
 cargo test --workspace
 
 # 2) 编译 Windows Release（flashdesk.exe 与 flashdesk-relay.exe）
@@ -170,10 +182,16 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
    # 测试 GUI 无参启动持续存活且无错误日志；测试 --self-test 返回 0：
    Start-Process -FilePath .\target\release\flashdesk.exe -ArgumentList "--self-test" -Wait -PassThru
    ```
+4. **5M 中转端到端基准（改动抓屏/编解码/传输/流控后必跑）**：真实编码器 + Noise + 流控/ABR + 解码器，只把屏幕换成 60Hz 合成桌面（滚动文档 + 打字），经过一个模拟国内 5M 小水管中转的限速代理（共享瓶颈、单向 15ms、1s 深缓冲）。退出码 0 = PASS（滚动 ≥ 0.9×目标帧率，且两个阶段“抓屏→解码”p95 ≤ 2×单向延迟 + 120ms）：
+   ```powershell
+   .\target\release\flashdesk.exe --link-bench | Out-String                                   # 默认 5Mbps / 1080p60 / 上限 4000kbps
+   .\target\release\flashdesk.exe --link-bench --bench-res 2560x1440 --bench-cap 1080 | Out-String  # 2K 屏 + 1080p 上限
+   .\target\release\flashdesk.exe --link-bench --bench-no-ack | Out-String                    # 对照：关闭帧确认（旧传输行为）
+   ```
 
 ---
 
-## 四、完整踩坑记录与避坑红线（Pitfalls #1–#15）
+## 四、完整踩坑记录与避坑红线（Pitfalls #1–#16）
 
 ### A. 工具链、编译与打包类
 
@@ -263,6 +281,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 #### 坑 #12：国内 5M 小水管中转默认 `4500 kbps` 造成 `500 ms` 排队延迟
 - **现象**：国内 5M 节点连接后延迟飙升至 `500 ms` 并拥塞丢帧。
 - **方案**：在 [crates/desk-app/src/config.rs](../crates/desk-app/src/config.rs) 将 `default_bitrate_kbps` 下调为 **`2500`**（2.5 Mbps，兼顾 60fps 清晰度与 5M 带宽余量；大带宽/局域网可在 HUD 滑块随时拉高至 50 Mbps，旧配置文件需在 UI 滑块或 `flashdesk.config.json` 中手动修改 `default_bitrate_kbps`）。
+- **2026-11 更新（见坑 #16）**：根因其实是“固定码率 + 无拥塞控制 + 深缓冲”。现已有帧确认驱动的延迟闸门与自适应码率，`default_bitrate_kbps` 变成 **ABR 上限**，新配置默认 **`4000`**（5M 中转实测稳定在 ~4 Mbps 以内）；旧配置文件里保存的 2500 不会被改动，可在设置或 HUD 的「码率上限」滑块调高。
 
 #### 坑 #13：发版更新时的进程锁与“只更新了一端”失效问题
 - **现象**：直接复制覆盖 `target\release\flashdesk.exe` 时若桌面仍开着软件会报 `文件正被另一进程使用`；若只更新主控端而忘记更新**被控端**或**Ubuntu 中转端**，抓屏/编码或重连路由修复均不生效。
@@ -300,12 +319,41 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 - **红线**：今后任何“服务是否可用”的判断一律走 `agent_healthy()`，禁止再直接用 `query_service_state() == Running` 决定 accept/端口归属；跨会话 `CreateProcessAsUserW` 前必须显式启用 `SeTcbPrivilege`。
 - **真机验证（2026-11-23，域管办公机）**：服务日志依次出现 `enabled service privilege: SeTcbPrivilege…` → 主路径仍 `0x80070005 (GetLastError=5)` → `winlogon fallback: pid=… token session=2` → `spawned Session 2 agent process`；`agent.status.json` 心跳 `elevated=true` 且 ≤3s 新鲜；19444 端口归属 agent（`listener active (agent=true)`），GUI 静默让权且中继 `accept_incoming=false`；`cargo test --workspace` 16/16、PE 零 MinGW DLL、洁净环境 `--self-test` exit 0；用户主控端初步测试反复连接联通。遗留：被服务/agent 进程映射的旧镜像 `target\release\flashdesk.exe.running-old` 需下次重启服务后删除；旧版刷屏日志保留于 `C:\ProgramData\FlashDesk\flashdesk.log` 作证据。
 
+#### 坑 #16：国内 5M 中转“连上了但很慢”——关键帧风暴 + 无拥塞控制 + 编解码憋帧（2026-11-23 修复）
+- **现象**：会话能建立，但画面越用越卡：滚动/拖窗口时 FPS 掉到个位数、操作要隔一两秒才在主控端出现；静止桌面上打字、点菜单也要等半秒到一秒才变；HUD 的「延迟」却只有几十 ms。
+- **根因（四层叠加）**：
+  1. **丢帧 → 强制关键帧 → 更堵**：主控端解码队列（8 帧）满了就丢帧，并且每丢一帧发一次 `RequestKeyframe`；被控端发送队列（2 帧）满了把**已编码**的帧丢掉再强制 IDR。2K 的 IDR 100–300 KB，在 5M 上要 0.2–0.5 s，一旦开始丢就全是关键帧。主控端 2K 每帧 CPU 标量 NV12→RGBA + egui 再拷一次，60fps 下解码线程本身就跟不上，正好触发它。
+  2. **固定码率 + 深缓冲 = 秒级排队**：码率不看实际吞吐，硬编 CBR 在滚动时超发；超出部分堆在被控端 socket、中转 512 KB 拷贝缓冲（5M 下≈0.8 s）、中转 TCP 缓冲里，被控端要等这些都堆满才察觉。HUD「延迟」是控制通道 Ping，量不到视频排队。
+  3. **异步 MFT 提前返回**：编码/解码在收到 `NeedInput` 时就返回空，这一帧要等“下一次调用”才出来；桌面不动时下一次调用就是 1 s 保活刷新。每次只取一个输出还会让积压越来越多。
+  4. **睡眠精度**：`std::thread::sleep` 在部分机器/虚拟机上按 10–15 ms 的系统 tick 取整（实测 Win11 VM 上 sleep(1ms) ≈ 12 ms，`timeBeginPeriod(1)` 也救不回来），节拍等待里几 ms 的 sleep 变成一个 tick，抓屏循环被卡在 ~40 fps；串行“抓屏+转换+编码”在 2K 下也超过 16.7 ms 预算。
+- **方案（已落地）**：
+  - **编码前背压**：被控端先确认网络写入有空位（`video_tx`）且流控闸门放行，才抓屏编码；编码出来的帧**永不丢弃**（编码线程 `blocking_send` 等写入）。关键帧请求两端都限频 ≥ 1 s；会话开始/切屏/桌面重获等本地原因立即 IDR。
+  - **帧确认 + 流控 + 自适应码率**（[net/flow.rs](crates/desk-app/src/net/flow.rs)）：主控端解码完成后经**视频连接反向**回 `FrameAck { frame_id, viewer_us }`（累计确认）。被控端用 AIMD 在途帧窗口把排队延迟压在 `QUEUE_BUDGET = 100 ms` 以内（瓶颈在链路或主控解码都适用；配 ProbeRTT 防基线漂移；ack 丢失 2 s 自动探测不卡死），并按“网络排队延迟”（扣除主控端解码时间）做 ABR：排队 > 45 ms 降到 ≤85%（链路受限时 ≤ 0.9×实测交付速率），排队 < 15 ms 且编码器确实在用预算时每 250 ms +5%，上限 = 用户「码率上限」。旧对端不回 ack 时自动退回原固定码率行为。
+  - **主控端不丢帧**：网络读取 `send().await` 进解码队列；解码线程批量取出、全部解码但**只转最新一帧**，直接写成 egui `ColorImage`（UI 线程只上传）；NV12/I420→RGBA、BGRA→NV12 全部多线程分带并行（与旧标量实现逐字节一致，有单测）。
+  - **冲刷憋帧**：每次真实变化/关键帧后补 3 个重复帧（静止画面几百字节）；异步 MFT 改为“排空所有就绪事件 + 自适应短等（编码 10 ms / 解码 8 ms，连续 8 次超时自动关闭）”；`poll_event_until` 前 2 ms 用 yield 轮询。
+  - **节拍与流水线**：进程启动 `timeBeginPeriod(1)` 并关闭计时器功耗节流；节拍等待用 [timing.rs](crates/desk-app/src/timing.rs) 自学习的“睡一部分 + yield 收尾”；抓屏/转换与编码拆成两级流水线（`flashdesk-host-encode` 线程，1 格队列），吞吐 = max(抓屏, 编码)。
+  - **分辨率上限**：主控端工具栏/设置可选 原始 / 1080p / 720p（`ControlMsg::SetResolutionCap`，按长边/短边适配横竖屏），被控端在编码前做面积平均缩放。
+  - **中转端**：控屏/视频通道 32 KB 转发缓冲 + Linux `TCP_NOTSENT_LOWAT` 16 KB，文件通道仍 512 KB（**需重新部署中转二进制**）。
+  - **OpenH264 回退**：屏幕内容模式、低复杂度、不做周期 IDR / 场景切换 IDR，码率经 `SetOption` 动态调整（不重建、不出 IDR）。不要开启其跳帧（实测会在只用 1/6 预算时把滚动掉到 38fps），也不要传真实时间戳（其输入帧率限制会因抓屏抖动丢帧）。MF 硬编设置长 GOP（fps×600）。
+- **验证（2026-11-23，4 vCPU 虚拟机、无硬件编码器，OpenH264 软编 + MS H.264 软解，host/viewer/限速代理同机）**：`cargo test --workspace` 38/38（含 9 个 5M 链路仿真用例）；`--self-test` 洁净 PATH 实时 DXGI 抓屏通过；PE 零 MinGW DLL；`flashdesk.exe --link-bench`（单向 15 ms、1 s 深缓冲）：
+
+  | 场景 | 滚动文字 fps / p95 | 大面积视频（打满链路）fps / p95 | 稀疏打字 p95 |
+  |---|---|---|---|
+  | 1080p60，5 Mbps，上限 4 Mbps | 56–60 fps / 61 ms | 58 fps / 83 ms | 44 ms |
+  | 2560×1440 + 1080p 上限，5 Mbps | 59.7 fps / 74 ms | 54 fps / 118 ms | 51 ms |
+  | 3 Mbps 拥塞 + 8 Mbps 上限，**关闭帧确认（旧传输行为）** | 56 fps / 65 ms | 23 fps / **1983 ms** | **2005 ms** |
+  | 3 Mbps 拥塞 + 8 Mbps 上限，**新流控** | 56 fps / 63 ms | 28.5 fps / **221 ms** | **39 ms** |
+
+  延迟为“合成屏幕出新画面 → 主控端解码完成”（含编码、网络、解码，不含显示器刷新）。拥塞场景下新流控把画面延迟从 ~2 s 压到 ~0.2 s；该场景帧率只有 28fps 是因为 OpenH264 软编不遵守码率目标（要 1.5 Mbps 给 3 Mbps），硬件编码器会降画质保帧率。真机（NVENC/QSV 硬编、host 与 viewer 分机）预期优于此表，但**尚未在真机上实测**。
+- **红线**：见 AGENTS.md 第 8–10 条（编码前背压/永不丢已编码帧/关键帧限频；`FrameAck` 走视频反向且协议变体只能追加；中转交互通道小缓冲）。改动抓屏/编解码/传输/流控后必须跑 `--link-bench`。
+
 ---
 
 ## 五、后续接手可扩展方向
 
-1. **动态码率自适应（ABR）**：目前在 `host_session.rs` 已测得 `encode_us` 与 `video_tx.try_send()` 满队丢帧信号，可结合 `Ping`/`Pong` RTT 趋势自动下调/恢复编码码率，应对国内 5M 波动。
-2. **D3D11 GPU 零拷贝 `BGRA -> NV12` 与硬编直通**：当前 DXGI 拷贝到 CPU staging 后运行 `bgra_to_nv12`，若进一步把 `ID3D11VideoProcessor` 或 Compute Shader + D3D11 纹理直喂 MF 硬件编码器，可降低 2K/4K 下的 CPU 占用。
-3. **系统托盘（Tray）与后台驻留**：无安装服务纯绿色模式下支持最小化到右下角系统托盘。
-4. **音频转发通道**：`protocol::relay::ChannelKind::AudioReserved` 已在协议层与中转层预留枚举，后续可直接复用独立音频流（WASAPI Loopback + Opus）接入。
-5. **中转端热重载吊销列表**：当前编辑 `/etc/flashdesk/relay.toml` 后需 `systemctl restart flashdesk-relay`，后续可响应 `SIGHUP` 热刷新 `RelayState.revoked_ids`。
+1. ~~动态码率自适应（ABR）~~：已于 2026-11 落地（坑 #16，`net/flow.rs`）。可继续：把 ABR 目标与分辨率联动（持续低于 ~2 Mbps 时自动降到 1080p/720p）。
+2. **D3D11 GPU 零拷贝 `BGRA -> NV12` 与硬编直通**：当前 DXGI 拷贝到 CPU staging 后运行 `bgra_to_nv12`（2026-11 起已多线程分带并行），若进一步把 `ID3D11VideoProcessor` 或 Compute Shader + D3D11 纹理直喂 MF 硬件编码器，可再降 2K/4K 下的 CPU 占用；主控端同理可用 NV12 纹理 + 着色器转 RGB。
+3. **剪贴板大图分片**：剪贴板图片（≤8 MiB PNG）仍是控制通道上的单条消息，传输期间会挡住后续键鼠事件（帧确认已移到视频通道反向，不受影响）。可改为文件通道传输或分片交错发送。
+4. **系统托盘（Tray）与后台驻留**：无安装服务纯绿色模式下支持最小化到右下角系统托盘。
+5. **音频转发通道**：`protocol::relay::ChannelKind::AudioReserved` 已在协议层与中转层预留枚举，后续可直接复用独立音频流（WASAPI Loopback + Opus）接入。
+6. **中转端热重载吊销列表**：当前编辑 `/etc/flashdesk/relay.toml` 后需 `systemctl restart flashdesk-relay`，后续可响应 `SIGHUP` 热刷新 `RelayState.revoked_ids`。
