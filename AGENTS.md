@@ -36,6 +36,8 @@
 
 ## 3. 修改后的标准编译、打包与验收命令
 
+> 完整测试步骤（含 `--link-bench` 输出解读与真机联调清单）见 [docs/TESTING.md](docs/TESTING.md)。**项目目录与 Rust 工具链/编译输出是分开的**：工具链在 `D:\Rust`，编译产物在 `D:\Rust\target-flashdesk`（不在项目里），项目的 `target\release\` 只是复制过去的发布副本；写命令时用明确路径，不要假设产物或工具链在项目目录内。
+
 ```powershell
 # 1. 全量测试 + Windows Release + Linux 静态 Relay 交叉编译
 $env:RUSTUP_HOME = "D:\Rust\rustup"; $env:CARGO_HOME = "D:\Rust\cargo"

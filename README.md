@@ -85,4 +85,5 @@ cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 
 - [AGENTS.md](AGENTS.md) — 接手速查红线（工具链、十条架构红线、验收命令）
 - [docs/ARCHITECTURE_AND_PITFALLS.md](docs/ARCHITECTURE_AND_PITFALLS.md) — 完整架构与 Pitfalls #1–#16
+- [docs/TESTING.md](docs/TESTING.md) — 测试指南：项目目录与 `D:\Rust` 工具链分开的路径约定、自动化测试、打包审计、`--self-test`、`--link-bench` 基准解读、真机联调清单
 - [deploy/README.md](deploy/README.md) — Ubuntu 中转部署与运维
