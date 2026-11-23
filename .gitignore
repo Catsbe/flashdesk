@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.key
+*.fdesk
+config.json
+flashdesk.config.json
+relay.toml
+*.log

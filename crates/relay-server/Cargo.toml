@@ -1,0 +1,26 @@
+[package]
+name = "relay-server"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "relay_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "flashdesk-relay"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+bincode = "1"
+clap = { version = "4", features = ["derive"] }
+protocol = { path = "../protocol" }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }

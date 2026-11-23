@@ -1,0 +1,9 @@
+# Normalize line endings; keep shell scripts strictly LF (Pitfall #4 / red line #6).
+* text=auto
+*.sh text eol=lf
+deploy/deploy-relay.sh text eol=lf
+*.rs text
+*.toml text
+*.md text
+*.json text
+*.lock text
