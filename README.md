@@ -63,7 +63,7 @@ cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 ### 3. 部署中转服务器
 
 见 [deploy/README.md](deploy/README.md)：上传 `deploy-relay.sh` + `flashdesk-relay-linux-x86_64`，
-`sudo bash deploy-relay.sh --port 19443 --root-pubkey "<你的根公钥>"` 一键完成（BBR、systemd、防火墙）。
+`sudo bash deploy-relay.sh --port 9442 --root-pubkey "<你的根公钥>"` 一键完成（BBR、systemd、防火墙）。
 
 ## 安全与隐私
 

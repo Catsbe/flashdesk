@@ -21,10 +21,10 @@ SSH 登录 Ubuntu 服务器后执行：
 
 ```bash
 cd /tmp/flashdesk
-sudo bash deploy-relay.sh --port 19443 --root-pubkey "粘贴你复制的根公钥"
+sudo bash deploy-relay.sh --port 9442 --root-pubkey "粘贴你复制的根公钥"
 ```
 
-> **穿透公司严格防火墙小技巧**：如果公司网络屏蔽非标端口，可以把 `--port 19443` 改为 `--port 443`（脚本已自动授予 `CAP_NET_BIND_SERVICE` 权限，安全监听 443 端口）。
+> **穿透公司严格防火墙小技巧**：如果公司网络屏蔽非标端口，可以把 `--port 9442` 改为 `--port 443`（脚本已自动授予 `CAP_NET_BIND_SERVICE` 权限，安全监听 443 端口）。
 
 部署脚本会自动完成：
 1. 安装静态二进制至 `/opt/flashdesk/flashdesk-relay`
@@ -33,7 +33,9 @@ sudo bash deploy-relay.sh --port 19443 --root-pubkey "粘贴你复制的根公�
 4. 注册 `systemd` 后台服务（开机自启、崩溃自动拉起）
 5. 若启用了 `ufw` 则自动放行端口
 
-> **提醒**：请在阿里云 / 腾讯云 / 海外云厂商控制台的**安全组 / 防火墙**中也放行对应的 TCP 端口（`19443` 或 `443`）。
+> **提醒**：请在阿里云 / 腾讯云 / 海外云厂商控制台的**安全组 / 防火墙**中也放行对应的 TCP 端口（`9442` 或 `443`）。
+>
+> **若宿主机使用原生 `nftables`（而非 `ufw`）**：`deploy-relay.sh` 不会自动修改 `nftables`。请确认 `/etc/nftables.conf` 已放行目标 TCP 端口，并确保热插规则位于 `reject with tcp reset` 之前（`sudo nft insert rule inet filter input handle <reject_handle> tcp dport <端口> ct state new accept`）；若宿主机同时运行 Docker，避免直接 `flush ruleset` 或整表重启 `nftables`，以免冲掉 Docker 的转发与 NAT 规则。
 
 ---
 

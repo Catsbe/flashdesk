@@ -13,7 +13,7 @@ usage() {
     cat <<EOF
 用法: sudo bash $0 [选项]
 选项:
-  --port <端口>            监听 TCP 端口（默认 19443，推荐 443 可过企业防火墙）
+  --port <端口>            监听 TCP 端口（默认 9442，推荐 443 可过企业防火墙）
   --root-pubkey <Base64>   从 Windows 客户端「设置与密钥」复制的个人根公钥
   --binary <路径>          flashdesk-relay Linux 二进制路径（默认自动查找同目录 flashdesk-relay-linux-x86_64）
   --uninstall              停止并卸载 flashdesk-relay 服务
@@ -78,8 +78,8 @@ fi
 
 # Interactive prompts if flags were omitted
 if [[ -z "${PORT}" ]]; then
-    read -r -p "请输入监听端口 [默认 19443，如需伪装 HTTPS 端口可填 443]: " input_port || true
-    PORT="${input_port:-19443}"
+    read -r -p "请输入监听端口 [默认 9442，如需伪装 HTTPS 端口可填 443]: " input_port || true
+    PORT="${input_port:-9442}"
 fi
 
 if ! [[ "${PORT}" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then

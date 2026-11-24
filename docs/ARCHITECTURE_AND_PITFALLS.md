@@ -1,6 +1,6 @@
 # FlashDesk 架构设计、开发约束与踩坑交接文档
 
-> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#15）。
+> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#19）。
 
 ---
 
@@ -193,7 +193,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 
 ---
 
-## 四、完整踩坑记录与避坑红线（Pitfalls #1–#18）
+## 四、完整踩坑记录与避坑红线（Pitfalls #1–#19）
 
 ### A. 工具链、编译与打包类
 
@@ -376,6 +376,21 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 
   延迟为“合成屏幕出新画面 → 主控端解码完成”（含编码、网络、解码，不含显示器刷新）。拥塞场景下新流控把画面延迟从 ~2 s 压到 ~0.2 s；该场景帧率只有 28fps 是因为 OpenH264 软编不遵守码率目标（要 1.5 Mbps 给 3 Mbps），硬件编码器会降画质保帧率。真机（NVENC/QSV 硬编、host 与 viewer 分机）预期优于此表，但**尚未在真机上实测**。
 - **红线**：见 AGENTS.md 第 8–10 条（编码前背压/永不丢已编码帧/关键帧限频；`FrameAck` 走视频反向且协议变体只能追加；中转交互通道小缓冲）。改动抓屏/编解码/传输/流控后必须跑 `--link-bench`。
+
+#### 坑 #19：阿里云安全组已放行，但宿主机 `nftables` 仅放行白名单 IP/端口导致外机连不上（2026-11-24）
+- **现象**：主电脑可以正常连接中转端口（如 `9442` / `19443`），但换到另一台不同公网出口 IP 的笔记本后 `Test-NetConnection` 持续 `TcpTestSucceeded : False`；在云服务器上用 `sudo tcpdump -ni any tcp port <端口>` 抓包，发现外机 IP 的 TCP `[S]`（SYN）握手包已经到达 `eth0`，但服务器内核在约 40 µs 内直接回 `[R.]`（TCP Reset）。与此同时 `iptables -L INPUT` 看起来没有拦截规则，宿主机也未安装 `ufw`。
+- **根因**：宿主机启用了原生 **`nftables`**（`/etc/nftables.conf` 中的 `table inet filter`）：
+  1. 主电脑所在的公网出口 IP 恰在 `whitelist_ipv4` 集合内，因此所有端口都被无条件放行；
+  2. 非白名单外部 IP 只允许访问硬编码的少数端口（如 `22` / `80` / `443` / `9443`），其余 TCP 端口全部落到链尾的 `meta l4proto tcp reject with tcp reset`；
+  3. [deploy/deploy-relay.sh](../deploy/deploy-relay.sh) 仅在检测到 `ufw` 时自动放行端口，不会修改 `nftables`。
+- **排查与方案**：
+  - **排查命令**：`sudo nft list ruleset`、`sudo tcpdump -ni any tcp port <端口>`（区分包被云安全组/客户端侧丢弃，还是已到达宿主机但被内核拒绝）。
+  - **热放行（必须插在 `reject with tcp reset` 之前）**：
+    ```bash
+    H=$(sudo nft -a list chain inet filter input | awk '/reject with tcp reset/{print $NF; exit}')
+    sudo nft insert rule inet filter input handle "$H" tcp dport <端口> ct state new accept
+    ```
+  - **持久化**：在 `/etc/nftables.conf` 对应端口集合中补充 `<端口>` 后执行 `sudo nft -c -f /etc/nftables.conf` 做语法干跑校验；**若宿主机同时跑 Docker，切忌直接 `flush ruleset` 或整表重启 `nftables`**，以免误清 Docker 管理的 `ip filter` / `ip nat` 转发规则。
 
 ---
 

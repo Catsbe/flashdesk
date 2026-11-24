@@ -105,7 +105,7 @@ fn identity_card(
                         .collect::<Vec<_>>()
                         .join(", ");
                     let toml_text = format!(
-                        "listen_addr = \"0.0.0.0:19443\"\nroot_pubkey_b64 = \"{pub_b64}\"\nrevoked_device_ids = [{revoked}]\npending_timeout_secs = 15\n"
+                        "listen_addr = \"0.0.0.0:9442\"\nroot_pubkey_b64 = \"{pub_b64}\"\nrevoked_device_ids = [{revoked}]\npending_timeout_secs = 15\n"
                     );
                     ui.ctx().copy_text(toml_text);
                     toast(ui, state, Tone::Ok, "已复制完整 relay.toml，粘贴到云服务器即可");
@@ -293,7 +293,7 @@ fn relays_card(
                 for (idx, node) in bundle.relay_nodes.iter_mut().enumerate() {
                     theme::label_max_width(ui, theme::mono(&node.id), NODE_ID_W);
                     let r1 = theme::text_input(ui, &mut node.name, field_w, "名称");
-                    let r2 = theme::text_input(ui, &mut node.addr, field_w, "1.2.3.4:19443");
+                    let r2 = theme::text_input(ui, &mut node.addr, field_w, "1.2.3.4:9442");
                     if theme::committed(&r1) || theme::committed(&r2) {
                         *changed = true;
                     }
@@ -308,7 +308,7 @@ fn relays_card(
 
                 theme::text_input(ui, &mut state.new_node_id, NODE_ID_W, "新节点 ID");
                 theme::text_input(ui, &mut state.new_node_name, field_w, "名称，如 香港 1G");
-                theme::text_input(ui, &mut state.new_node_addr, field_w, "1.2.3.4:19443");
+                theme::text_input(ui, &mut state.new_node_addr, field_w, "1.2.3.4:9442");
                 role_combo(ui, "new_node_role", &mut state.new_node_role);
                 if theme::small_button(ui, "添加", Kind::Secondary).clicked() {
                     let id = state.new_node_id.trim().to_string();

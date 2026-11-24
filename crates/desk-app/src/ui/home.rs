@@ -41,20 +41,12 @@ impl Default for HomeState {
 
 /// Relay list written into a freshly created personal root (edit the addresses in Settings).
 pub(crate) fn default_relays() -> Vec<RelayNodeConfig> {
-    vec![
-        RelayNodeConfig {
-            id: "cn-5m".into(),
-            name: "国内 5M (低延迟控屏)".into(),
-            addr: "127.0.0.1:19443".into(),
-            role: RelayNodeRole::PrimaryControl,
-        },
-        RelayNodeConfig {
-            id: "global-1g".into(),
-            name: "海外 1G (高速大文件)".into(),
-            addr: "127.0.0.1:19443".into(),
-            role: RelayNodeRole::FilePreferred,
-        },
-    ]
+    vec![RelayNodeConfig {
+        id: "cn-5m".into(),
+        name: "国内 5M (低延迟控屏)".into(),
+        addr: "127.0.0.1:9442".into(),
+        role: RelayNodeRole::PrimaryControl,
+    }]
 }
 
 /// Status dot colour + one-line description of how this machine runs.
