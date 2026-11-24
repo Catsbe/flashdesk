@@ -95,11 +95,12 @@ e:\Antigravity项目\自用远程软件\
             │   ├── bench.rs            # --link-bench：合成桌面 + 限速中转代理的端到端基准（标记块测“抓屏→解码”延迟）
             │   └── direct.rs           # TCP 19444 局域网直连监听与通道分流（serve_direct_connection 供基准复用）
             └── ui\                     # egui 界面层
-                ├── fonts.rs            # C:\Windows\Fonts\msyh.ttc 中文字体加载与暗色主题
-                ├── app.rs              # 主窗口切换、配置保存热重载、热切中转节点
-                ├── home.rs             # 本机状态、一键初始化/导入、服务/VDD 快捷状态、在线设备、IP 直连
-                ├── settings.rs         # Root CA 签发/.fdesk/Base64/一键复制 relay.toml、节点管理、服务/VDD/吊销管理
-                └── remote_view.rs      # 远控画面、HUD、热切控屏中转节点、双栏文件管理+拖拽上传、剪贴板与虚拟屏浮窗
+                ├── theme.rs            # 强制暗色主题（不跟随系统浅色）、msyh/msyhbd 字体、色板与卡片/按钮/分段/开关/Toast 组件
+                ├── sysinfo.rs          # 服务/agent/虚拟屏/局域网 IP 状态后台轮询（2 s），UI 线程只读快照
+                ├── app.rs              # 顶部导航 + 居中内容列、配置保存热重载、热切中转节点
+                ├── home.rs             # 首次使用引导、本机身份与状态、在线设备 + IP 直连、中转线路选择
+                ├── settings.rs         # Root CA 签发/.fdesk/导入码/一键复制 relay.toml、节点管理、画面默认值、服务/VDD/吊销（输入框失焦才保存）
+                └── remote_view.rs      # 远控画面、悬浮工具栏（画质/工具弹出菜单）、HUD、热切控屏中转节点、双栏文件管理+拖拽上传、虚拟屏浮窗、断开对话框
 ```
 
 ### 2. 核心会话与分流拓扑
@@ -191,7 +192,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 
 ---
 
-## 四、完整踩坑记录与避坑红线（Pitfalls #1–#16）
+## 四、完整踩坑记录与避坑红线（Pitfalls #1–#17）
 
 ### A. 工具链、编译与打包类
 
@@ -237,6 +238,22 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 - **现象**：此前为避免双显卡 DXGI 冲突，将 `eframe` 的 `wgpu` 改为 `PowerPreference::LowPower` 后，UI 选中了 Intel(R) Graphics Vulkan 驱动（日志出现 `WARN wgpu_hal::vulkan::conv: Unrecognized present mode 1000361000`），导致远控画面与断开后的主界面均大面积出现黑白色块撕裂与剧烈闪烁（且 `flashdesk.exe` 体积膨胀到 12 MB）。
 - **方案**：在 [crates/desk-app/Cargo.toml](../crates/desk-app/Cargo.toml) 将 `eframe` 渲染后端由 `"wgpu"` 切换为 **`"glow"`**（原生 Windows WGL OpenGL，`opengl32.dll`），移除 `wgpu_options`。切回后 `flashdesk.exe` 体积降至 `8.72 MB`，零 Vulkan present-mode 警告，兼容独显/核显/办公集显/虚拟机。**切勿改回 `wgpu` 默认或强行指定 Intel Vulkan。**
 
+#### 坑 #17：打包后界面“又丑又挤”——跟随系统浅色主题、每帧查系统状态、egui 布局陷阱（2026-11-24 改版）
+- **现象**：Windows 浅色模式下主页背景变浅灰、卡片却是写死的深色，卡片里的文字几乎看不清；各区块横向挤成一行；远控工具栏比窗口还宽、两端被截断，HUD 文字折行；设置页每输入一个字符就重写 `config.json` 并重连中转。
+- **根因**：egui 默认跟随系统主题，而各页面手写了深色填充；主页/设置页每次重绘都同步调用 `query_service_state()` / `agent_healthy()` / `detect_vdd_status()` / `local_lan_ip()`（SCM、SetupAPI、网卡枚举），鼠标一动就是每秒几十次；文本框 `.changed()` 即保存。
+- **方案（已落地）**：
+  - [ui/theme.rs](../crates/desk-app/src/ui/theme.rs)：`ctx.set_theme(Dark)` 强制暗色，Light 也设成同一套样式；统一色板、微软雅黑常规 + 粗体（`msyhbd.ttc`）、卡片/按钮/分段选择/开关/Toast 组件；内容限制在居中的 900 px 列。新页面一律用这些组件，不要再手写颜色。
+  - [ui/sysinfo.rs](../crates/desk-app/src/ui/sysinfo.rs)：后台线程 `flashdesk-ui-status` 每 2 s 刷新状态快照，变化时才请求重绘；**UI 线程禁止再直接调用上述系统查询**。
+  - 设置页文本框失焦 / 回车才保存，滑块拖动结束才保存。
+  - 远控工具栏精简为「画质 / 工具」两个弹出菜单 + 文件传输 + 全屏 + 断开；断开原因改为模态对话框。
+- **egui 0.31 布局避坑**：
+  - 弹出菜单（`popup_below_widget`）内部是 *justified* 布局，换行文字会被两端拉开 → 包一层 `ui.vertical`；
+  - 自适应大小的 `Area`（HUD 等）里 `Label` 会按上一帧宽度折行 → 用 `Label::extend()`；
+  - `Grid` 里 `TextEdit::desired_width` 不生效（会缩成上一帧列宽）→ 用 `add_sized`（`theme::text_input` 已封装）；
+  - `right_to_left` 布局里嵌套 `horizontal` 会继承反向，嵌套 `with_layout(left_to_right)` 又会撑满整行 → 顶栏中转徽标按固定尺寸用 painter 绘制；
+  - 顶层直接 `ui.with_layout(right_to_left(Align::Center))` 会在整个剩余高度里垂直居中 → 先套 `ui.horizontal`；
+  - 微软雅黑没有 `✕ ✓ ⬆` 等符号（显示为方框），emoji 小字号会变形 → 关闭按钮、文件夹/文件图标用 painter 画。
+
 ---
 
 ### C. 抓屏与硬件/软件编解码类
@@ -270,7 +287,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 ### D. 中转网络、重连稳定性与发版类
 
 #### 坑 #11：“只连上一次，之后再也连不上”的半开路由与阻塞退出 Bug
-- **现象**：首次控制可连上，断开后再次点击「连接控制」持续失败或长期转圈。
+- **现象**：首次控制可连上，断开后再次点击「连接」持续失败或长期转圈。
 - **根因（客户端 + 服务端叠加）**：
   1. **中转服务端**：[crates/relay-server/src/state.rs](../crates/relay-server/src/state.rs) 的 `deduplicated_devices()` 与 `get_peer_sender()` 原先使用 `vec.iter().find(|e| e.accept_incoming)` 从**队列头部（最旧连接）**匹配；被控端若刚触发断线重连，旧的半开死连接在 `PRESENCE_IDLE_TIMEOUT`（原长达 `120s`）到期前仍排在 index 0，导致所有 `IncomingChannel` 永远被发往死 socket；
   2. **客户端握手与退出**：`NoiseStream::handshake_initiator` / `handshake_responder` 无超时限制；断开会话时主循环直接 `std::thread::JoinHandle::join()` 阻塞 Tokio 工作线程；[host_session.rs](../crates/desk-app/src/net/host_session.rs) 抓屏失败退出时未通过 `Notify` 及时唤醒 `ctrl_reader.recv_msg()` 退出会话。
@@ -281,7 +298,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 #### 坑 #12：国内 5M 小水管中转默认 `4500 kbps` 造成 `500 ms` 排队延迟
 - **现象**：国内 5M 节点连接后延迟飙升至 `500 ms` 并拥塞丢帧。
 - **方案**：在 [crates/desk-app/src/config.rs](../crates/desk-app/src/config.rs) 将 `default_bitrate_kbps` 下调为 **`2500`**（2.5 Mbps，兼顾 60fps 清晰度与 5M 带宽余量；大带宽/局域网可在 HUD 滑块随时拉高至 50 Mbps，旧配置文件需在 UI 滑块或 `flashdesk.config.json` 中手动修改 `default_bitrate_kbps`）。
-- **2026-11 更新（见坑 #16）**：根因其实是“固定码率 + 无拥塞控制 + 深缓冲”。现已有帧确认驱动的延迟闸门与自适应码率，`default_bitrate_kbps` 变成 **ABR 上限**，新配置默认 **`4000`**（5M 中转实测稳定在 ~4 Mbps 以内）；旧配置文件里保存的 2500 不会被改动，可在设置或 HUD 的「码率上限」滑块调高。
+- **2026-11 更新（见坑 #16）**：根因其实是“固定码率 + 无拥塞控制 + 深缓冲”。现已有帧确认驱动的延迟闸门与自适应码率，`default_bitrate_kbps` 变成 **ABR 上限**，新配置默认 **`4000`**（5M 中转实测稳定在 ~4 Mbps 以内）；旧配置文件里保存的 2500 不会被改动，可在「设置 → 画面与传输」或远控工具栏「画质」里的「码率上限」滑块调高。
 
 #### 坑 #13：发版更新时的进程锁与“只更新了一端”失效问题
 - **现象**：直接复制覆盖 `target\release\flashdesk.exe` 时若桌面仍开着软件会报 `文件正被另一进程使用`；若只更新主控端而忘记更新**被控端**或**Ubuntu 中转端**，抓屏/编码或重连路由修复均不生效。

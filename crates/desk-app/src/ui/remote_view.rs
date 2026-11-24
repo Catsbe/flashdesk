@@ -1,12 +1,15 @@
-use crate::net::viewer_session::{ReconnectTarget, ViewerCommand, ViewerSessionHandle};
+use crate::net::viewer_session::{HudStats, ReconnectTarget, ViewerCommand, ViewerSessionHandle};
+use crate::transfer::client_manager::FileCommand;
 use crate::transfer::{list_local_dir, TransferDirection, TransferState};
+use crate::ui::theme::{self, c, Kind};
 use crate::vdd::{MTT_VDD_DOWNLOAD_URL, PARSEC_VDD_DOWNLOAD_URL};
 use eframe::egui::{
-    self, pos2, vec2, Align2, Color32, ColorImage, CornerRadius, Event, Key, Modifiers,
-    PointerButton, Rect, RichText, Sense, TextureHandle, TextureOptions, ViewportCommand,
+    self, pos2, vec2, Align, Align2, Color32, ColorImage, CornerRadius, CursorIcon, Event, Frame,
+    Key, Layout, Margin, Modifiers, PointerButton, Rect, RichText, Sense, Shadow, Stroke,
+    TextureHandle, TextureOptions, ViewportCommand,
 };
 use protocol::auth::RelayNodeConfig;
-use protocol::session::{InputEvent, MouseBtn, VddRequest};
+use protocol::session::{InputEvent, MonitorInfo, MouseBtn, VddRequest};
 use protocol::transfer::FileEntry;
 use std::path::{Path, PathBuf};
 use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
@@ -29,6 +32,7 @@ pub struct RemoteViewState {
     scale_mode: ScaleMode,
     fullscreen: bool,
     toolbar_collapsed: bool,
+    show_stats: bool,
     bitrate_mbps: f32,
     target_fps: u32,
     /// Resolution cap by height (0 = native, 1080, 720).
@@ -63,6 +67,7 @@ impl RemoteViewState {
             scale_mode: ScaleMode::Fit,
             fullscreen: false,
             toolbar_collapsed: false,
+            show_stats: true,
             bitrate_mbps: (initial_bitrate_kbps as f32 / 1000.0).clamp(1.0, 50.0),
             target_fps: initial_fps,
             res_cap_h: initial_res_cap_h,
@@ -93,6 +98,17 @@ impl RemoteViewState {
             }
         }
     }
+
+    fn toggle_file_panel(&mut self, session: &ViewerSessionHandle) {
+        self.show_file_panel = !self.show_file_panel;
+        if self.show_file_panel && !self.file_panel_initialized {
+            self.refresh_local_dir();
+            session
+                .file_client
+                .send(FileCommand::ListRemoteDir(String::new()));
+            self.file_panel_initialized = true;
+        }
+    }
 }
 
 pub fn render_remote_view(
@@ -101,6 +117,7 @@ pub fn render_remote_view(
     session: &ViewerSessionHandle,
 ) -> RemoteViewAction {
     let mut action = RemoteViewAction::None;
+    let mut go_back = false;
 
     if let Some(frame) = session.latest_frame.lock().unwrap().take() {
         // Already converted to egui's pixel format on the decode thread: just upload.
@@ -132,7 +149,7 @@ pub fn render_remote_view(
 
     // Central video panel
     egui::CentralPanel::default()
-        .frame(egui::Frame::NONE.fill(Color32::BLACK))
+        .frame(Frame::NONE.fill(Color32::BLACK))
         .show(ctx, |ui| {
             let avail = ui.available_rect_before_wrap();
 
@@ -181,23 +198,7 @@ pub fn render_remote_view(
                     }
                 }
             } else {
-                ui.centered_and_justified(|ui| {
-                    if hud.connecting {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new(format!(
-                                "正在建立端到端加密通道 ({})...",
-                                session.via_label
-                            ))
-                            .size(16.0)
-                            .color(Color32::LIGHT_GRAY),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new("等待远程画面首帧...").color(Color32::LIGHT_GRAY),
-                        );
-                    }
-                });
+                waiting_placeholder(ui, avail, &hud, session);
             }
         });
 
@@ -212,23 +213,25 @@ pub fn render_remote_view(
         let via = session.file_client.active_via_label.lock().unwrap().clone();
         egui::Area::new(egui::Id::new("drag_drop_overlay"))
             .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
-                egui::Frame::NONE
-                    .fill(Color32::from_rgba_unmultiplied(15, 55, 50, 230))
-                    .corner_radius(CornerRadius::same(12))
-                    .inner_margin(egui::Margin::same(24))
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(16, 44, 41, 242))
+                    .stroke(Stroke::new(1.5_f32, c::ACCENT))
+                    .corner_radius(CornerRadius::same(16))
+                    .inner_margin(Margin::symmetric(32, 24))
+                    .shadow(overlay_shadow())
                     .show(ui, |ui| {
-                        ui.heading(
-                            RichText::new(format!(
-                                "📥 松开鼠标以发送 {hovered_count} 个文件到远程主机"
-                            ))
-                            .color(Color32::from_rgb(130, 250, 200)),
-                        );
-                        ui.label(
-                            RichText::new(format!("传输通道: {via} (SHA-256 校验 + 断点续传)"))
-                                .color(Color32::WHITE),
-                        );
+                        ui.set_width(440.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(theme::title(format!(
+                                "松开鼠标，发送 {hovered_count} 个文件到远程电脑"
+                            )));
+                            ui.label(theme::muted(format!(
+                                "通道：{via} · SHA-256 校验 · 断点续传"
+                            )));
+                        });
                     });
             });
     }
@@ -238,12 +241,10 @@ pub fn render_remote_view(
         for df in dropped_files {
             if let Some(path) = df.path {
                 if path.is_file() {
-                    session
-                        .file_client
-                        .send(crate::transfer::client_manager::FileCommand::UploadFile {
-                            local_path: path,
-                            remote_dir: remote_dir.clone(),
-                        });
+                    session.file_client.send(FileCommand::UploadFile {
+                        local_path: path,
+                        remote_dir: remote_dir.clone(),
+                    });
                     count += 1;
                 }
             }
@@ -254,288 +255,122 @@ pub fn render_remote_view(
                 state.refresh_local_dir();
                 session
                     .file_client
-                    .send(crate::transfer::client_manager::FileCommand::ListRemoteDir(
-                        remote_dir,
-                    ));
+                    .send(FileCommand::ListRemoteDir(remote_dir));
                 state.file_panel_initialized = true;
             }
             state.drop_notice = Some(format!("已加入 {count} 个上传任务"));
         }
     }
 
-    // Top collapsible floating toolbar
+    // Floating toolbar (top centre). Rarely used settings live in two popovers so the bar stays
+    // narrow enough for small windows.
     egui::Area::new(egui::Id::new("remote_toolbar"))
-        .anchor(Align2::CENTER_TOP, vec2(0.0, 8.0))
+        .anchor(Align2::CENTER_TOP, vec2(0.0, 10.0))
+        .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            egui::Frame::window(ui.style())
-                .fill(Color32::from_rgba_unmultiplied(18, 22, 30, 236))
-                .inner_margin(egui::Margin::symmetric(10, 6))
+            Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(21, 25, 33, 244))
+                .stroke(Stroke::new(1.0_f32, c::BORDER_STRONG))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::symmetric(8, 6))
+                .shadow(overlay_shadow())
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let toggle_txt = if state.toolbar_collapsed { "▼ 展开" } else { "▲ 收起" };
-                        if ui.small_button(toggle_txt).clicked() {
-                            state.toolbar_collapsed = !state.toolbar_collapsed;
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let collapsed = state.toolbar_collapsed;
+                        if theme::chevron_button(ui, !collapsed)
+                            .on_hover_text(if collapsed { "展开工具栏" } else { "收起工具栏" })
+                            .clicked()
+                        {
+                            state.toolbar_collapsed = !collapsed;
                         }
-                        ui.label(
-                            RichText::new(&session.peer_name)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
+                        ui.add_space(4.0);
+                        let dot = if disconnect_reason.is_some() {
+                            c::DANGER
+                        } else if state.texture.is_none() {
+                            c::WARN
+                        } else {
+                            c::OK
+                        };
+                        theme::status_dot(ui, dot);
+                        ui.add_space(2.0);
+                        ui.label(theme::bold(&session.peer_name).size(14.0))
+                            .on_hover_text(&session.via_label);
+                        ui.add_space(4.0);
 
-                        if !state.toolbar_collapsed {
-                            ui.separator();
-
-                            // Monitor selector
-                            let mon_label = if active_mon == u32::MAX {
-                                "全部显示器全景".into()
-                            } else {
-                                monitors
-                                    .iter()
-                                    .find(|m| m.index == active_mon)
-                                    .map(|m| {
-                                        format!("屏{} ({}x{})", m.index + 1, m.width, m.height)
-                                    })
-                                    .unwrap_or_else(|| format!("屏{}", active_mon + 1))
-                            };
-                            egui::ComboBox::from_id_salt("remote_mon_sel")
-                                .selected_text(mon_label)
-                                .width(135.0)
-                                .show_ui(ui, |ui| {
+                        if !collapsed {
+                            toolbar_sep(ui);
+                            if monitors.len() > 1 {
+                                let label = monitor_label(&monitors, active_mon);
+                                toolbar_popup(ui, &label, "tb_monitor", 250.0, |ui| {
                                     for m in &monitors {
                                         let txt = format!(
-                                            "显示器 {} ({}x{}, {}dpi)",
+                                            "显示器 {} · {}×{} · {} dpi",
                                             m.index + 1,
                                             m.width,
                                             m.height,
                                             m.dpi
                                         );
-                                        if ui
-                                            .selectable_value(&mut active_mon, m.index, txt)
-                                            .changed()
+                                        if ui.selectable_label(active_mon == m.index, txt).clicked()
+                                            && active_mon != m.index
                                         {
-                                            session.send(ViewerCommand::SetMonitor(active_mon));
+                                            active_mon = m.index;
+                                            session.send(ViewerCommand::SetMonitor(m.index));
+                                            ui.memory_mut(|mem| mem.close_popup());
                                         }
                                     }
-                                    if monitors.len() > 1
-                                        && ui
-                                            .selectable_value(
-                                                &mut active_mon,
-                                                u32::MAX,
-                                                "全部显示器全景",
-                                            )
-                                            .changed()
+                                    if ui
+                                        .selectable_label(active_mon == u32::MAX, "全部显示器（全景）")
+                                        .clicked()
+                                        && active_mon != u32::MAX
                                     {
+                                        active_mon = u32::MAX;
                                         session.send(ViewerCommand::SetMonitor(u32::MAX));
+                                        ui.memory_mut(|mem| mem.close_popup());
                                     }
                                 });
-
-                            // Live relay node hot-switch
-                            if matches!(session.reconnect_target, ReconnectTarget::Relay { .. })
-                                && session.available_relays.len() > 1
-                            {
-                                let cur_id = session.current_ctrl_relay_id.clone().unwrap_or_default();
-                                let cur_name = session
-                                    .available_relays
-                                    .iter()
-                                    .find(|r| r.id == cur_id)
-                                    .map(|r| r.name.clone())
-                                    .unwrap_or_else(|| "切换节点".into());
-                                egui::ComboBox::from_id_salt("ctrl_relay_switch")
-                                    .selected_text(cur_name)
-                                    .width(120.0)
-                                    .show_ui(ui, |ui| {
-                                        for r in &session.available_relays {
-                                            let selected = r.id == cur_id;
-                                            if ui.selectable_label(selected, &r.name).clicked()
-                                                && !selected
-                                            {
-                                                action = RemoteViewAction::SwitchControlRelay(
-                                                    r.clone(),
-                                                );
-                                            }
-                                        }
-                                    });
                             }
-
-                            ui.separator();
-                            ui.label(RichText::new("码率上限").color(Color32::GRAY))
-                                .on_hover_text("自适应码率不会超过此值；网络变差时自动下调，延迟保持在 100ms 量级");
-                            let br_resp = ui.add(
-                                egui::Slider::new(&mut state.bitrate_mbps, 1.0..=50.0)
-                                    .suffix("M")
-                                    .fixed_decimals(1),
-                            );
-                            if br_resp.drag_stopped() || br_resp.lost_focus() {
-                                session.send(ViewerCommand::SetBitrate(
-                                    (state.bitrate_mbps * 1000.0).round() as u32,
-                                ));
+                            let multi_relay = matches!(
+                                session.reconnect_target,
+                                ReconnectTarget::Relay { .. }
+                            ) && session.available_relays.len() > 1;
+                            let quality_w = if multi_relay { 470.0 } else { 370.0 };
+                            toolbar_popup(ui, "画质", "tb_quality", quality_w, |ui| {
+                                quality_menu(ui, state, session, multi_relay, &mut action);
+                            });
+                            toolbar_popup(ui, "工具", "tb_tools", 250.0, |ui| {
+                                tools_menu(ui, state, session);
+                            });
+                            if theme::pill(ui, "文件传输", state.show_file_panel, false).clicked() {
+                                state.toggle_file_panel(session);
                             }
-
-                            let res_label = match state.res_cap_h {
-                                1080 => "1080p",
-                                720 => "720p",
-                                _ => "原始分辨率",
-                            };
-                            egui::ComboBox::from_id_salt("remote_res_cap")
-                                .selected_text(res_label)
-                                .width(92.0)
-                                .show_ui(ui, |ui| {
-                                    for (h, txt) in [(0u32, "原始分辨率"), (1080, "1080p"), (720, "720p")] {
-                                        if ui.selectable_value(&mut state.res_cap_h, h, txt).changed() {
-                                            let (l, s) = crate::config::res_cap_for_height(h);
-                                            session.send(ViewerCommand::SetResolutionCap(l, s));
-                                        }
-                                    }
-                                })
-                                .response
-                                .on_hover_text("2K/4K 屏走小带宽中转时选 1080p：每帧数据量减半，更流畅");
-
-                            if ui.selectable_value(&mut state.target_fps, 30, "30").changed() {
-                                session.send(ViewerCommand::SetFps(30));
-                            }
-                            if ui.selectable_value(&mut state.target_fps, 60, "60fps").changed() {
-                                session.send(ViewerCommand::SetFps(60));
-                            }
-
-                            ui.separator();
-                            if ui
-                                .selectable_label(state.show_file_panel, "📁 文件")
-                                .clicked()
-                            {
-                                state.show_file_panel = !state.show_file_panel;
-                                if state.show_file_panel && !state.file_panel_initialized {
-                                    state.refresh_local_dir();
-                                    session.file_client.send(
-                                        crate::transfer::client_manager::FileCommand::ListRemoteDir(
-                                            String::new(),
-                                        ),
-                                    );
-                                    state.file_panel_initialized = true;
-                                }
-                            }
-                            if ui
-                                .checkbox(&mut state.clipboard_enabled, "📋 剪贴板")
-                                .changed()
-                            {
-                                session.send(ViewerCommand::SetClipboardEnabled(
-                                    state.clipboard_enabled,
-                                ));
-                            }
-                            if ui
-                                .selectable_label(state.show_vdd_window, "🖥 虚拟屏")
-                                .clicked()
-                            {
-                                state.show_vdd_window = !state.show_vdd_window;
-                                if state.show_vdd_window {
-                                    session.send(ViewerCommand::VddAction(VddRequest::Query));
-                                }
-                            }
-
-                            let fit_txt = match state.scale_mode {
-                                ScaleMode::Fit => "自适应",
-                                ScaleMode::Original => "1:1",
-                            };
-                            if ui.small_button(fit_txt).clicked() {
-                                state.scale_mode = match state.scale_mode {
-                                    ScaleMode::Fit => ScaleMode::Original,
-                                    ScaleMode::Original => ScaleMode::Fit,
-                                };
-                            }
-
-                            if ui
-                                .small_button(if state.fullscreen { "退出全屏" } else { "全屏" })
+                            toolbar_sep(ui);
+                            let fs_label = if state.fullscreen { "退出全屏" } else { "全屏" };
+                            if theme::pill(ui, fs_label, false, false)
+                                .on_hover_text("F11")
                                 .clicked()
                             {
                                 state.fullscreen = !state.fullscreen;
                                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(state.fullscreen));
                             }
-
-                            if ui.small_button("Ctrl+Alt+Del").clicked() {
-                                session.send(ViewerCommand::Input(InputEvent::SendSas));
-                            }
+                            ui.add_space(2.0);
                         }
 
-                        if ui
-                            .button(RichText::new("断开").color(Color32::from_rgb(255, 115, 115)))
-                            .clicked()
-                        {
-                            if state.fullscreen {
-                                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
-                            }
+                        if theme::small_button(ui, "断开", Kind::Danger).clicked() {
                             session.send(ViewerCommand::Disconnect);
-                            action = RemoteViewAction::Disconnect;
+                            go_back = true;
                         }
                     });
                 });
         });
 
-    // Top-right semi-transparent HUD
-    egui::Area::new(egui::Id::new("remote_hud"))
-        .anchor(Align2::RIGHT_TOP, vec2(-12.0, 56.0))
-        .interactable(false)
-        .show(ctx, |ui| {
-            egui::Frame::NONE
-                .fill(Color32::from_rgba_unmultiplied(12, 16, 22, 195))
-                .corner_radius(CornerRadius::same(6))
-                .inner_margin(egui::Margin::same(8))
-                .show(ui, |ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "FPS: {:.1} | 延迟: {} ms | 码率: {:.2} Mbps",
-                            hud.fps, hud.rtt_ms, hud.bitrate_mbps
-                        ))
-                        .monospace()
-                        .size(12.0)
-                        .color(Color32::from_rgb(130, 245, 195)),
-                    );
-                    if let Some(host) = hud.host.as_ref().filter(|h| h.flow_control) {
-                        // "画面" = host hand-off -> decoded here (includes all queueing on the path).
-                        ui.label(
-                            RichText::new(format!(
-                                "画面: {} ms (峰值 {}) | 自适应码率: {:.1}/{:.1} Mbps | 解码: {:.1}ms{}",
-                                host.avg_delay_ms,
-                                host.max_delay_ms,
-                                host.sent_kbps as f32 / 1000.0,
-                                host.target_kbps as f32 / 1000.0,
-                                hud.decode_ms,
-                                if host.paused_ticks > 0 {
-                                    format!(" | 限流 {} 帧", host.paused_ticks)
-                                } else {
-                                    String::new()
-                                }
-                            ))
-                            .monospace()
-                            .size(11.0)
-                            .color(Color32::from_rgb(160, 210, 255)),
-                        );
-                    }
-                    let codec_disp = if hud.codec_label.is_empty() {
-                        "协商中...".into()
-                    } else {
-                        hud.codec_label.clone()
-                    };
-                    let res_disp = if hud.remote_res.is_empty() {
-                        "-".into()
-                    } else {
-                        hud.remote_res.clone()
-                    };
-                    ui.label(
-                        RichText::new(format!(
-                            "{} | {} | 编码: {:.1}ms | {}",
-                            res_disp,
-                            codec_disp,
-                            hud.encode_us as f32 / 1000.0,
-                            hud.relay_name
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(Color32::LIGHT_GRAY),
-                    );
-                    if let Some(notice) = &hud.status_notice {
-                        ui.colored_label(Color32::from_rgb(255, 210, 120), notice);
-                    }
-                });
-        });
+    // Live stats (top right, below the toolbar)
+    if state.show_stats {
+        egui::Area::new(egui::Id::new("remote_hud"))
+            .anchor(Align2::RIGHT_TOP, vec2(-12.0, 62.0))
+            .interactable(false)
+            .show(ctx, |ui| hud_panel(ui, &hud));
+    }
 
     // M2 Dual-Pane File Transfer Manager Window
     if state.show_file_panel {
@@ -547,23 +382,535 @@ pub fn render_remote_view(
         render_remote_vdd_window(ctx, state, session);
     }
 
-    if let Some(reason) = disconnect_reason {
-        egui::Window::new("会话已断开")
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(reason);
-                if ui.button("返回设备列表").clicked() {
-                    if state.fullscreen {
-                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+    if let Some(reason) = &disconnect_reason {
+        egui::Modal::new(egui::Id::new("session_closed_modal")).show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.label(theme::title("会话已断开"));
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(theme::muted(reason.as_str())).wrap());
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if theme::button(ui, "返回设备列表", Kind::Primary).clicked() {
+                        go_back = true;
                     }
-                    action = RemoteViewAction::Disconnect;
-                }
+                });
             });
+        });
+    }
+
+    if go_back {
+        if state.fullscreen {
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        }
+        action = RemoteViewAction::Disconnect;
     }
 
     action
+}
+
+fn overlay_shadow() -> Shadow {
+    Shadow {
+        offset: [0, 6],
+        blur: 22,
+        spread: 0,
+        color: Color32::from_black_alpha(130),
+    }
+}
+
+/// Shown until the first decoded frame arrives.
+fn waiting_placeholder(
+    ui: &mut egui::Ui,
+    avail: Rect,
+    hud: &HudStats,
+    session: &ViewerSessionHandle,
+) {
+    let rect = Rect::from_center_size(avail.center(), vec2(avail.width().min(520.0), 140.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+        ui.vertical_centered(|ui| {
+            ui.add(egui::Spinner::new().size(30.0).color(c::ACCENT));
+            ui.add_space(12.0);
+            let (heading, sub) = if hud.connecting {
+                (
+                    format!("正在连接 {}", session.peer_name),
+                    format!("正在建立端到端加密通道 · {}", session.via_label),
+                )
+            } else {
+                (
+                    "已连接，等待远程画面…".to_string(),
+                    format!("{} · {}", session.peer_name, session.via_label),
+                )
+            };
+            ui.label(theme::title(heading));
+            ui.label(theme::muted(sub));
+            if let Some(notice) = &hud.status_notice {
+                ui.label(RichText::new(notice).size(12.5).color(c::WARN));
+            }
+        });
+    });
+}
+
+fn toolbar_sep(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(vec2(9.0, 18.0), Sense::hover());
+    ui.painter()
+        .vline(rect.center().x, rect.y_range(), Stroke::new(1.0_f32, c::BORDER_STRONG));
+}
+
+/// Toolbar button that opens a popover below itself.
+fn toolbar_popup(
+    ui: &mut egui::Ui,
+    label: &str,
+    id: &str,
+    width: f32,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let popup_id = ui.make_persistent_id(id);
+    let open = ui.memory(|m| m.is_popup_open(popup_id));
+    let resp = theme::pill(ui, label, open, true);
+    if resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            add(ui);
+        },
+    );
+}
+
+fn monitor_label(monitors: &[MonitorInfo], active: u32) -> String {
+    if active == u32::MAX {
+        return "全部显示器".into();
+    }
+    monitors
+        .iter()
+        .find(|m| m.index == active)
+        .map(|m| format!("显示器 {}", m.index + 1))
+        .unwrap_or_else(|| format!("显示器 {}", active + 1))
+}
+
+fn menu_label(text: &str) -> RichText {
+    RichText::new(text).size(13.0).color(c::TEXT_2)
+}
+
+fn quality_menu(
+    ui: &mut egui::Ui,
+    state: &mut RemoteViewState,
+    session: &ViewerSessionHandle,
+    multi_relay: bool,
+    action: &mut RemoteViewAction,
+) {
+    egui::Grid::new("quality_grid")
+        .num_columns(2)
+        .spacing([14.0, 12.0])
+        .show(ui, |ui| {
+            ui.label(menu_label("帧率"));
+            let mut fps = state.target_fps;
+            if theme::segmented(ui, &mut fps, &[(30, "30 FPS"), (60, "60 FPS")]) {
+                state.target_fps = fps;
+                session.send(ViewerCommand::SetFps(fps));
+            }
+            ui.end_row();
+
+            ui.label(menu_label("码率上限"));
+            let resp = ui.add(
+                egui::Slider::new(&mut state.bitrate_mbps, 1.0..=50.0)
+                    .step_by(0.5)
+                    .fixed_decimals(1)
+                    .suffix(" Mbps"),
+            );
+            if resp.drag_stopped() || resp.lost_focus() || (resp.changed() && !resp.dragged()) {
+                session.send(ViewerCommand::SetBitrate(
+                    (state.bitrate_mbps * 1000.0).round() as u32,
+                ));
+            }
+            ui.end_row();
+
+            ui.label(menu_label("分辨率上限"));
+            let mut h = state.res_cap_h;
+            if theme::segmented(ui, &mut h, &[(0, "原始"), (1080, "1080p"), (720, "720p")]) {
+                state.res_cap_h = h;
+                let (l, s) = crate::config::res_cap_for_height(h);
+                session.send(ViewerCommand::SetResolutionCap(l, s));
+            }
+            ui.end_row();
+
+            if multi_relay {
+                ui.label(menu_label("控屏线路"));
+                let cur_id = session.current_ctrl_relay_id.clone().unwrap_or_default();
+                let mut idx = session
+                    .available_relays
+                    .iter()
+                    .position(|r| r.id == cur_id)
+                    .unwrap_or(usize::MAX);
+                let opts: Vec<(usize, &str)> = session
+                    .available_relays
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (i, r.name.as_str()))
+                    .collect();
+                if theme::segmented(ui, &mut idx, &opts) {
+                    if let Some(r) = session.available_relays.get(idx) {
+                        *action = RemoteViewAction::SwitchControlRelay(r.clone());
+                        ui.memory_mut(|mem| mem.close_popup());
+                    }
+                }
+                ui.end_row();
+            }
+        });
+    // Popovers lay out "justified", which would stretch the gaps in this wrapped note.
+    ui.vertical(|ui| {
+        ui.add(
+            egui::Label::new(theme::faint(
+                "自适应码率不会超过上限，网络变差时自动下调；2K/4K 屏走小带宽中转建议选 1080p。",
+            ))
+            .wrap(),
+        );
+    });
+}
+
+fn tools_menu(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSessionHandle) {
+    egui::Grid::new("tools_grid")
+        .num_columns(2)
+        .spacing([14.0, 10.0])
+        .show(ui, |ui| {
+            ui.label(menu_label("剪贴板同步"));
+            if theme::toggle(ui, &mut state.clipboard_enabled).changed() {
+                session.send(ViewerCommand::SetClipboardEnabled(state.clipboard_enabled));
+            }
+            ui.end_row();
+
+            ui.label(menu_label("性能统计"));
+            theme::toggle(ui, &mut state.show_stats);
+            ui.end_row();
+
+            ui.label(menu_label("画面缩放"));
+            theme::segmented(
+                ui,
+                &mut state.scale_mode,
+                &[(ScaleMode::Fit, "适应窗口"), (ScaleMode::Original, "1:1")],
+            );
+            ui.end_row();
+        });
+    theme::divider(ui);
+    if theme::button(ui, "远程虚拟显示器…", Kind::Ghost).clicked() {
+        state.show_vdd_window = true;
+        session.send(ViewerCommand::VddAction(VddRequest::Query));
+        ui.memory_mut(|mem| mem.close_popup());
+    }
+    if theme::button(ui, "发送 Ctrl+Alt+Del", Kind::Ghost).clicked() {
+        session.send(ViewerCommand::Input(InputEvent::SendSas));
+        ui.memory_mut(|mem| mem.close_popup());
+    }
+}
+
+fn hud_panel(ui: &mut egui::Ui, hud: &HudStats) {
+    Frame::new()
+        .fill(Color32::from_rgba_unmultiplied(13, 16, 22, 220))
+        .stroke(Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 22)))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = vec2(5.0, 3.0);
+            ui.horizontal(|ui| {
+                metric(ui, &format!("{:.0}", hud.fps), "fps");
+                ui.add_space(8.0);
+                metric(ui, &hud.rtt_ms.to_string(), "ms 延迟");
+                ui.add_space(8.0);
+                metric(ui, &format!("{:.1}", hud.bitrate_mbps), "Mbps");
+            });
+            if let Some(host) = hud.host.as_ref().filter(|h| h.flow_control) {
+                // "画面" = host hand-off -> decoded here (includes all queueing on the path).
+                let paused = if host.paused_ticks > 0 {
+                    format!(" · 限流 {} 帧", host.paused_ticks)
+                } else {
+                    String::new()
+                };
+                ui.add(hud_text(format!(
+                    "画面 {} ms（峰值 {}）· 码率 {:.1}/{:.1} M · 解码 {:.1} ms{paused}",
+                    host.avg_delay_ms,
+                    host.max_delay_ms,
+                    host.sent_kbps as f32 / 1000.0,
+                    host.target_kbps as f32 / 1000.0,
+                    hud.decode_ms,
+                )));
+            }
+            let codec = if hud.codec_label.is_empty() {
+                "协商中…"
+            } else {
+                hud.codec_label.as_str()
+            };
+            let res = if hud.remote_res.is_empty() {
+                "-"
+            } else {
+                hud.remote_res.as_str()
+            };
+            ui.add(hud_text(format!(
+                "{res} · {codec} · 编码 {:.1} ms · {}",
+                hud.encode_us as f32 / 1000.0,
+                hud.relay_name
+            )));
+            if let Some(notice) = &hud.status_notice {
+                ui.add(egui::Label::new(RichText::new(notice).size(12.0).color(c::WARN)).extend());
+            }
+        });
+}
+
+fn metric(ui: &mut egui::Ui, value: &str, unit: &str) {
+    ui.label(RichText::new(value).monospace().size(17.0).color(c::TEXT));
+    ui.label(RichText::new(unit).size(11.5).color(c::TEXT_3));
+}
+
+fn hud_text(text: String) -> egui::Label {
+    // `extend`: labels in an auto-sized overlay would otherwise wrap at last frame's width.
+    egui::Label::new(RichText::new(text).size(11.5).color(c::TEXT_2)).extend()
+}
+
+enum RowAction {
+    None,
+    Open,
+    Transfer,
+}
+
+/// One file / folder row: click a folder to open it, the button transfers a file.
+fn entry_row(ui: &mut egui::Ui, entry: &FileEntry, transfer_label: &str) -> RowAction {
+    let mut act = RowAction::None;
+    let row_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 28.0));
+    // Registered before the row's own widgets so the transfer button stays clickable on top.
+    let row = ui.interact(row_rect, ui.id().with(("entry_row", &entry.path)), Sense::click());
+    if row.contains_pointer() {
+        ui.painter()
+            .rect_filled(row_rect, CornerRadius::same(6), c::SURFACE_2);
+    }
+    if entry.is_dir {
+        if row.clicked() {
+            act = RowAction::Open;
+        }
+        row.on_hover_cursor(CursorIcon::PointingHand);
+    }
+    ui.horizontal(|ui| {
+        ui.set_height(28.0);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.add_space(2.0);
+            if !entry.is_dir {
+                if theme::small_button(ui, transfer_label, Kind::Ghost).clicked() {
+                    act = RowAction::Transfer;
+                }
+                ui.label(theme::faint(format_bytes(entry.size)));
+            }
+            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add_space(6.0);
+                paint_entry_icon(ui, entry.is_dir);
+                ui.add_space(4.0);
+                let color = if entry.is_dir { c::TEXT } else { c::TEXT_2 };
+                ui.add(
+                    egui::Label::new(RichText::new(&entry.name).color(color))
+                        .truncate()
+                        .selectable(false),
+                );
+            });
+        });
+    });
+    act
+}
+
+/// Small painted folder / document icon (emoji glyphs render tiny and skewed at this size).
+fn paint_entry_icon(ui: &mut egui::Ui, is_dir: bool) {
+    let (rect, _) = ui.allocate_exact_size(vec2(18.0, 16.0), Sense::hover());
+    let p = ui.painter();
+    let (l, t) = (rect.left() + 1.0, rect.top() + 1.0);
+    if is_dir {
+        let fill = Color32::from_rgb(226, 182, 92);
+        p.rect_filled(
+            Rect::from_min_max(pos2(l, t + 1.0), pos2(l + 7.0, t + 5.0)),
+            CornerRadius::same(2),
+            fill,
+        );
+        p.rect_filled(
+            Rect::from_min_max(pos2(l, t + 3.0), pos2(l + 16.0, t + 14.0)),
+            CornerRadius::same(2),
+            fill,
+        );
+        p.line_segment(
+            [pos2(l + 1.0, t + 5.5), pos2(l + 15.0, t + 5.5)],
+            Stroke::new(1.0_f32, Color32::from_rgb(190, 146, 64)),
+        );
+    } else {
+        let stroke = Stroke::new(1.2_f32, c::TEXT_3);
+        p.rect_stroke(
+            Rect::from_min_max(pos2(l + 2.0, t), pos2(l + 14.0, t + 14.0)),
+            CornerRadius::same(2),
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        for i in 0..3 {
+            let y = t + 4.5 + i as f32 * 3.0;
+            p.line_segment([pos2(l + 5.0, y), pos2(l + 11.0, y)], Stroke::new(1.0_f32, c::TEXT_3));
+        }
+    }
+}
+
+fn pane_frame() -> Frame {
+    Frame::new()
+        .fill(c::FIELD)
+        .stroke(Stroke::new(1.0_f32, c::BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(10))
+}
+
+fn local_pane(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSessionHandle) {
+    pane_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::bold("本地电脑").size(14.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::small_button(ui, "刷新", Kind::Ghost).clicked() {
+                    state.refresh_local_dir();
+                }
+                if theme::small_button(ui, "上级", Kind::Ghost).clicked() {
+                    if let Some(parent) = Path::new(&state.local_dir).parent() {
+                        state.local_dir = parent.to_string_lossy().into_owned();
+                    } else {
+                        state.local_dir.clear();
+                    }
+                    state.refresh_local_dir();
+                }
+                if theme::small_button(ui, "盘符", Kind::Ghost).clicked() {
+                    state.local_dir.clear();
+                    state.refresh_local_dir();
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 62.0).max(80.0);
+            let resp = theme::text_input(ui, &mut state.local_dir, w, "本地路径，留空显示盘符");
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if theme::small_button(ui, "前往", Kind::Secondary).clicked() || enter {
+                state.refresh_local_dir();
+            }
+        });
+        if let Some(err) = &state.local_error {
+            ui.label(RichText::new(err).size(12.5).color(c::DANGER));
+        }
+        let entries = state.local_entries.clone();
+        let cur_remote_dir = session.file_client.remote_dir.lock().unwrap().clone();
+        egui::ScrollArea::vertical()
+            .id_salt("local_entries")
+            .max_height(240.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if entries.is_empty() {
+                    ui.label(theme::faint("（空）"));
+                }
+                for entry in entries {
+                    match entry_row(ui, &entry, "上传 →") {
+                        RowAction::Open => {
+                            state.local_dir = entry.path.clone();
+                            state.refresh_local_dir();
+                        }
+                        RowAction::Transfer => {
+                            session.file_client.send(FileCommand::UploadFile {
+                                local_path: PathBuf::from(&entry.path),
+                                remote_dir: cur_remote_dir.clone(),
+                            });
+                        }
+                        RowAction::None => {}
+                    }
+                }
+            });
+    });
+}
+
+fn remote_pane(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSessionHandle) {
+    pane_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(theme::bold("远程电脑").size(14.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::small_button(ui, "刷新", Kind::Ghost).clicked() {
+                    session
+                        .file_client
+                        .send(FileCommand::ListRemoteDir(state.remote_dir_input.clone()));
+                }
+                if theme::small_button(ui, "上级", Kind::Ghost).clicked() {
+                    let next = Path::new(state.remote_dir_input.trim())
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    session.file_client.send(FileCommand::ListRemoteDir(next));
+                }
+                if theme::small_button(ui, "盘符", Kind::Ghost).clicked() {
+                    session
+                        .file_client
+                        .send(FileCommand::ListRemoteDir(String::new()));
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            let w = (ui.available_width() - 62.0).max(80.0);
+            let resp =
+                theme::text_input(ui, &mut state.remote_dir_input, w, "远程路径，留空显示盘符");
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if theme::small_button(ui, "前往", Kind::Secondary).clicked() || enter {
+                session
+                    .file_client
+                    .send(FileCommand::ListRemoteDir(state.remote_dir_input.clone()));
+            }
+        });
+
+        if session
+            .file_client
+            .remote_loading
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().size(14.0).color(c::ACCENT));
+                ui.label(theme::faint("正在读取远程目录…"));
+            });
+        }
+        if let Some(err) = session.file_client.remote_error.lock().unwrap().clone() {
+            ui.label(RichText::new(err).size(12.5).color(c::DANGER));
+        }
+
+        let r_entries = session.file_client.remote_entries.lock().unwrap().clone();
+        let local_target_dir = if state.local_dir.trim().is_empty() {
+            crate::transfer::default_receive_dir()
+        } else {
+            PathBuf::from(&state.local_dir)
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("remote_entries")
+            .max_height(240.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                if r_entries.is_empty() {
+                    ui.label(theme::faint("（空）"));
+                }
+                for entry in r_entries {
+                    match entry_row(ui, &entry, "← 下载") {
+                        RowAction::Open => {
+                            session
+                                .file_client
+                                .send(FileCommand::ListRemoteDir(entry.path.clone()));
+                        }
+                        RowAction::Transfer => {
+                            session.file_client.send(FileCommand::DownloadFile {
+                                remote_path: entry.path.clone(),
+                                local_dir: local_target_dir.clone(),
+                            });
+                        }
+                        RowAction::None => {}
+                    }
+                }
+            });
+    });
 }
 
 fn render_file_manager_window(
@@ -571,8 +918,6 @@ fn render_file_manager_window(
     state: &mut RemoteViewState,
     session: &ViewerSessionHandle,
 ) {
-    use crate::transfer::client_manager::FileCommand;
-
     let remote_dir = session.file_client.remote_dir.lock().unwrap().clone();
     if remote_dir != state.last_synced_remote_dir {
         state.remote_dir_input = remote_dir.clone();
@@ -580,34 +925,39 @@ fn render_file_manager_window(
     }
 
     let mut open = state.show_file_panel;
-    egui::Window::new("📁 高速文件传输（支持拖拽、海外 1G 分流、断点续传、SHA-256 校验）")
+    egui::Window::new("文件传输")
+        .id(egui::Id::new("file_transfer_window"))
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center() + vec2(0.0, 24.0))
         .open(&mut open)
-        .default_size([840.0, 520.0])
+        .default_size([880.0, 560.0])
+        .min_width(620.0)
         .resizable(true)
+        .collapsible(false)
         .show(ctx, |ui| {
-            // Relay channel selector bar
+            // Channel / relay selector bar
             let via = session.file_client.active_via_label.lock().unwrap().clone();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("当前文件传输通道:").strong());
-                ui.colored_label(Color32::from_rgb(110, 240, 200), &via);
+                ui.label(menu_label("传输通道"));
+                theme::chip(ui, &via, c::ACCENT_HOVER, c::ACCENT_SOFT);
 
                 if matches!(session.reconnect_target, ReconnectTarget::Relay { .. })
                     && !session.available_relays.is_empty()
                 {
-                    ui.separator();
-                    ui.label("切换文件节点:");
+                    ui.add_space(10.0);
+                    ui.label(menu_label("文件节点"));
                     let cur_label = state
                         .selected_file_relay_id
                         .as_ref()
                         .and_then(|id| session.available_relays.iter().find(|r| &r.id == id))
                         .map(|r| r.name.clone())
-                        .unwrap_or_else(|| "默认控屏节点".into());
+                        .unwrap_or_else(|| "默认（控屏节点）".into());
                     egui::ComboBox::from_id_salt("file_relay_pick")
                         .selected_text(cur_label)
-                        .width(190.0)
+                        .width(200.0)
                         .show_ui(ui, |ui| {
                             for node in &session.available_relays {
-                                let label = format!("{} ({})", node.name, node.role.label());
+                                let label = format!("{}（{}）", node.name, node.role.label());
                                 let is_sel =
                                     state.selected_file_relay_id.as_deref() == Some(&node.id);
                                 if ui.selectable_label(is_sel, label).clicked() && !is_sel {
@@ -621,289 +971,120 @@ fn render_file_manager_window(
                 }
 
                 if let Some(note) = state.drop_notice.clone() {
-                    ui.separator();
-                    ui.colored_label(Color32::from_rgb(140, 235, 160), note);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        theme::chip(ui, note, c::OK, Color32::from_rgb(18, 44, 36));
+                    });
                 }
             });
-            ui.separator();
+            ui.add_space(4.0);
 
-            // Dual pane browser
-            let avail_w = ui.available_width();
-            let col_w = (avail_w - 16.0) * 0.5;
             ui.columns(2, |cols| {
-                // Left: Local PC
-                cols[0].push_id("local_pane", |ui| {
-                    ui.set_min_width(col_w);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("💻 本地电脑").strong());
-                        if ui.small_button("根目录").clicked() {
-                            state.local_dir.clear();
-                            state.refresh_local_dir();
-                        }
-                        if ui.small_button("上级").clicked() {
-                            if let Some(parent) = Path::new(&state.local_dir).parent() {
-                                state.local_dir = parent.to_string_lossy().into_owned();
-                            } else {
-                                state.local_dir.clear();
-                            }
-                            state.refresh_local_dir();
-                        }
-                        if ui.small_button("刷新").clicked() {
-                            state.refresh_local_dir();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut state.local_dir)
-                                .desired_width(ui.available_width() - 50.0)
-                                .hint_text("输入本地路径，留空显示盘符"),
-                        );
-                        if ui.small_button("前往").clicked()
-                            || (resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(Key::Enter)))
-                        {
-                            state.refresh_local_dir();
-                        }
-                    });
-                    if let Some(err) = &state.local_error {
-                        ui.colored_label(Color32::from_rgb(255, 120, 120), err);
-                    }
-                    let entries = state.local_entries.clone();
-                    let cur_remote_dir = session.file_client.remote_dir.lock().unwrap().clone();
-                    egui::ScrollArea::vertical()
-                        .max_height(210.0)
-                        .show(ui, |ui| {
-                            for entry in entries {
-                                ui.horizontal(|ui| {
-                                    let icon = if entry.is_dir { "📁" } else { "📄" };
-                                    if entry.is_dir {
-                                        if ui.selectable_label(false, format!("{icon} {}", entry.name)).clicked() {
-                                            state.local_dir = entry.path;
-                                            state.refresh_local_dir();
-                                        }
-                                    } else {
-                                        ui.label(format!("{icon} {}", entry.name));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("上传 ➡").clicked() {
-                                                    session.file_client.send(
-                                                        FileCommand::UploadFile {
-                                                            local_path: PathBuf::from(&entry.path),
-                                                            remote_dir: cur_remote_dir.clone(),
-                                                        },
-                                                    );
-                                                }
-                                                ui.label(
-                                                    RichText::new(format_bytes(entry.size))
-                                                        .small()
-                                                        .color(Color32::GRAY),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                });
-
-                // Right: Remote Host
-                cols[1].push_id("remote_pane", |ui| {
-                    ui.set_min_width(col_w);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("🖥 远程主机").strong());
-                        if ui.small_button("根目录").clicked() {
-                            session
-                                .file_client
-                                .send(FileCommand::ListRemoteDir(String::new()));
-                        }
-                        if ui.small_button("上级").clicked() {
-                            let cur = state.remote_dir_input.trim();
-                            let next = Path::new(cur)
-                                .parent()
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            session.file_client.send(FileCommand::ListRemoteDir(next));
-                        }
-                        if ui.small_button("刷新").clicked() {
-                            session.file_client.send(FileCommand::ListRemoteDir(
-                                state.remote_dir_input.clone(),
-                            ));
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let resp = ui.add(
-                            egui::TextEdit::singleline(&mut state.remote_dir_input)
-                                .desired_width(ui.available_width() - 50.0)
-                                .hint_text("远程路径，留空显示盘符"),
-                        );
-                        if ui.small_button("前往").clicked()
-                            || (resp.lost_focus()
-                                && ui.input(|i| i.key_pressed(Key::Enter)))
-                        {
-                            session.file_client.send(FileCommand::ListRemoteDir(
-                                state.remote_dir_input.clone(),
-                            ));
-                        }
-                    });
-
-                    if session
-                        .file_client
-                        .remote_loading
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在读取远程目录...");
-                        });
-                    }
-                    if let Some(err) = session.file_client.remote_error.lock().unwrap().clone() {
-                        ui.colored_label(Color32::from_rgb(255, 120, 120), err);
-                    }
-
-                    let r_entries = session.file_client.remote_entries.lock().unwrap().clone();
-                    let local_target_dir = if state.local_dir.trim().is_empty() {
-                        crate::transfer::default_receive_dir()
-                    } else {
-                        PathBuf::from(&state.local_dir)
-                    };
-                    egui::ScrollArea::vertical()
-                        .max_height(210.0)
-                        .show(ui, |ui| {
-                            for entry in r_entries {
-                                ui.horizontal(|ui| {
-                                    let icon = if entry.is_dir { "📁" } else { "📄" };
-                                    if entry.is_dir {
-                                        if ui
-                                            .selectable_label(false, format!("{icon} {}", entry.name))
-                                            .clicked()
-                                        {
-                                            session.file_client.send(FileCommand::ListRemoteDir(
-                                                entry.path,
-                                            ));
-                                        }
-                                    } else {
-                                        ui.label(format!("{icon} {}", entry.name));
-                                        ui.with_layout(
-                                            egui::Layout::right_to_left(egui::Align::Center),
-                                            |ui| {
-                                                if ui.small_button("⬅ 下载").clicked() {
-                                                    session.file_client.send(
-                                                        FileCommand::DownloadFile {
-                                                            remote_path: entry.path.clone(),
-                                                            local_dir: local_target_dir.clone(),
-                                                        },
-                                                    );
-                                                }
-                                                ui.label(
-                                                    RichText::new(format_bytes(entry.size))
-                                                        .small()
-                                                        .color(Color32::GRAY),
-                                                );
-                                            },
-                                        );
-                                    }
-                                });
-                            }
-                        });
-                });
+                cols[0].push_id("local_pane", |ui| local_pane(ui, state, session));
+                cols[1].push_id("remote_pane", |ui| remote_pane(ui, state, session));
             });
 
-            ui.separator();
-            ui.label(RichText::new("传输队列（支持把本地文件直接拖进远控屏幕窗口上传）").strong());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::subheading("传输队列"));
+                ui.label(theme::faint("也可以把本地文件直接拖进远控画面上传"));
+            });
             let records = session.file_client.transfers.lock().unwrap().clone();
             if records.is_empty() {
-                ui.label(RichText::new("暂无传输任务。").color(Color32::GRAY));
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(150.0)
-                    .show(ui, |ui| {
-                        for rec in records {
-                            let dir_tag = match rec.direction {
-                                TransferDirection::Upload => "⬆ 上传",
-                                TransferDirection::Download => "⬇ 下载",
-                            };
-                            let progress = if rec.total_bytes > 0 {
-                                (rec.transferred_bytes as f32 / rec.total_bytes as f32)
-                                    .clamp(0.0, 1.0)
-                            } else if rec.state == TransferState::Done {
-                                1.0
-                            } else {
-                                0.0
-                            };
-
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(format!("{dir_tag} {}", rec.file_name)).strong())
-                                    .on_hover_text(format!("本地: {}\n远程: {}", rec.local_path, rec.remote_path));
-                                ui.label(
-                                    RichText::new(format!(
-                                        "{}/{}",
+                ui.label(theme::faint("暂无传输任务"));
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("transfer_queue")
+                .max_height(170.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    for rec in records {
+                        let progress = if rec.total_bytes > 0 {
+                            (rec.transferred_bytes as f32 / rec.total_bytes as f32).clamp(0.0, 1.0)
+                        } else if rec.state == TransferState::Done {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        Frame::new()
+                            .fill(c::SURFACE_2)
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(10, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    let dir_tag = match rec.direction {
+                                        TransferDirection::Upload => "上传",
+                                        TransferDirection::Download => "下载",
+                                    };
+                                    theme::tag(ui, dir_tag);
+                                    ui.label(theme::bold(&rec.file_name).size(13.5)).on_hover_text(
+                                        format!("本地：{}\n远程：{}", rec.local_path, rec.remote_path),
+                                    );
+                                    ui.label(theme::faint(format!(
+                                        "{} / {}",
                                         format_bytes(rec.transferred_bytes),
                                         format_bytes(rec.total_bytes)
-                                    ))
-                                    .small()
-                                    .monospace(),
-                                );
-                                ui.label(
-                                    RichText::new(format!("[{}]", rec.via_label))
-                                        .small()
-                                        .color(Color32::from_rgb(130, 200, 255)),
-                                );
-                                if rec.resumed {
-                                    ui.label(
-                                        RichText::new("[断点续传]")
-                                            .small()
-                                            .color(Color32::from_rgb(245, 210, 110)),
-                                    );
-                                }
-                                if rec.sha256_verified {
-                                    ui.label(
-                                        RichText::new("[SHA-256 ✓]")
-                                            .small()
-                                            .color(Color32::from_rgb(110, 240, 170)),
-                                    );
-                                }
-
-                                match &rec.state {
-                                    TransferState::Active => {
-                                        ui.label(
-                                            RichText::new(format!("{:.2} Mbps", rec.speed_mbps))
-                                                .small()
-                                                .color(Color32::from_rgb(120, 245, 200)),
-                                        );
-                                        if ui.small_button("取消").clicked() {
-                                            session
-                                                .file_client
-                                                .send(FileCommand::Cancel(rec.transfer_id));
+                                    )));
+                                    ui.label(theme::faint(&rec.via_label));
+                                    if rec.resumed {
+                                        theme::chip(ui, "断点续传", c::WARN, Color32::from_rgb(52, 40, 18));
+                                    }
+                                    if rec.sha256_verified {
+                                        theme::chip(ui, "SHA-256 已校验", c::OK, Color32::from_rgb(18, 44, 36));
+                                    }
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        match &rec.state {
+                                            TransferState::Active => {
+                                                if theme::small_button(ui, "取消", Kind::Ghost).clicked() {
+                                                    session
+                                                        .file_client
+                                                        .send(FileCommand::Cancel(rec.transfer_id));
+                                                }
+                                                ui.label(
+                                                    RichText::new(format!("{:.2} Mbps", rec.speed_mbps))
+                                                        .size(12.5)
+                                                        .color(c::ACCENT_HOVER),
+                                                );
+                                            }
+                                            TransferState::Queued => {
+                                                ui.label(theme::faint("排队中…"));
+                                            }
+                                            TransferState::Done => {
+                                                ui.label(RichText::new("已完成").size(12.5).color(c::OK));
+                                            }
+                                            TransferState::Cancelled => {
+                                                ui.label(
+                                                    RichText::new("已暂停（可续传）").size(12.5).color(c::WARN),
+                                                );
+                                            }
+                                            TransferState::Failed(err) => {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(format!("失败：{err}"))
+                                                            .size(12.5)
+                                                            .color(c::DANGER),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            }
                                         }
-                                    }
-                                    TransferState::Queued => {
-                                        ui.label("排队中...");
-                                    }
-                                    TransferState::Done => {
-                                        ui.colored_label(
-                                            Color32::from_rgb(110, 240, 170),
-                                            "已完成",
-                                        );
-                                    }
-                                    TransferState::Cancelled => {
-                                        ui.colored_label(
-                                            Color32::from_rgb(235, 200, 110),
-                                            "已暂停（可续传）",
-                                        );
-                                    }
-                                    TransferState::Failed(err) => {
-                                        ui.colored_label(
-                                            Color32::from_rgb(255, 115, 115),
-                                            format!("失败: {err}"),
-                                        );
-                                    }
-                                }
+                                    });
+                                });
+                                let bar = match rec.state {
+                                    TransferState::Done => c::OK,
+                                    TransferState::Failed(_) => c::DANGER,
+                                    TransferState::Cancelled => c::WARN,
+                                    _ => c::ACCENT,
+                                };
+                                ui.add(
+                                    egui::ProgressBar::new(progress)
+                                        .desired_height(5.0)
+                                        .fill(bar),
+                                );
                             });
-                            ui.add(egui::ProgressBar::new(progress).desired_height(6.0));
-                        }
-                    });
-            }
+                    }
+                });
         });
     state.show_file_panel = open;
 }
@@ -916,46 +1097,60 @@ fn render_remote_vdd_window(
     let mut open = state.show_vdd_window;
     let info = session.vdd_info.lock().unwrap().clone();
 
-    egui::Window::new("🖥 远程无显示器虚拟屏控制")
+    egui::Window::new("远程虚拟显示器")
+        .id(egui::Id::new("remote_vdd_window"))
+        .pivot(Align2::CENTER_CENTER)
+        .default_pos(ctx.screen_rect().center())
         .open(&mut open)
-        .default_width(420.0)
         .resizable(false)
+        .collapsible(false)
         .show(ctx, |ui| {
-            if let Some(v) = &info {
-                ui.label(format!("驱动状态: {}", v.details));
-                ui.label(format!("活动虚拟屏数量: {}", v.active_virtual_displays));
-            } else {
-                ui.label("正在查询远程主机虚拟屏状态...");
+            ui.set_width(430.0);
+            match &info {
+                Some(v) => {
+                    theme::form_row_w(ui, "驱动状态", 84.0, |ui| {
+                        ui.add(egui::Label::new(RichText::new(&v.details).color(c::TEXT)).wrap());
+                    });
+                    theme::form_row_w(ui, "活动虚拟屏", 84.0, |ui| {
+                        ui.label(RichText::new(v.active_virtual_displays.to_string()).color(c::TEXT));
+                    });
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(14.0).color(c::ACCENT));
+                        ui.label(theme::muted("正在查询远程电脑的虚拟屏状态…"));
+                    });
+                }
             }
-            ui.separator();
+            theme::divider(ui);
             ui.horizontal(|ui| {
-                if ui.button("➕ 创建 1080P 60Hz 虚拟屏").clicked() {
+                if theme::small_button(ui, "创建 1080P 60Hz", Kind::Secondary).clicked() {
                     session.send(ViewerCommand::VddAction(VddRequest::AddDisplay {
                         width: 1920,
                         height: 1080,
                         refresh_hz: 60,
                     }));
                 }
-                if ui.button("➕ 创建 2K 60Hz 虚拟屏").clicked() {
+                if theme::small_button(ui, "创建 2K 60Hz", Kind::Secondary).clicked() {
                     session.send(ViewerCommand::VddAction(VddRequest::AddDisplay {
                         width: 2560,
                         height: 1440,
                         refresh_hz: 60,
                     }));
                 }
-                if ui.button("🗑 移除虚拟屏").clicked() {
+                if theme::small_button(ui, "移除虚拟屏", Kind::Danger).clicked() {
                     session.send(ViewerCommand::VddAction(VddRequest::RemoveDisplay));
                 }
             });
-            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.small_button("🔄 刷新状态").clicked() {
+                if theme::small_button(ui, "刷新状态", Kind::Ghost).clicked() {
                     session.send(ViewerCommand::VddAction(VddRequest::Query));
                 }
-                if ui.small_button("下载 Parsec VDD").clicked() {
+                ui.label(theme::faint("驱动下载"));
+                if theme::small_button(ui, "Parsec VDD ↗", Kind::Ghost).clicked() {
                     crate::vdd::open_url(PARSEC_VDD_DOWNLOAD_URL);
                 }
-                if ui.small_button("下载 Virtual-Display-Driver").clicked() {
+                if theme::small_button(ui, "Virtual-Display-Driver ↗", Kind::Ghost).clicked() {
                     crate::vdd::open_url(MTT_VDD_DOWNLOAD_URL);
                 }
             });

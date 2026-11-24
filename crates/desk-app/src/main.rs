@@ -382,8 +382,8 @@ fn main() -> Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 700.0])
-            .with_min_inner_size([720.0, 480.0])
+            .with_inner_size([1060.0, 740.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_title("FlashDesk — 自建高速远程桌面"),
         ..Default::default()
     };
