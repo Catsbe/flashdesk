@@ -10,6 +10,7 @@ use crate::net::viewer_session::{
 use crate::net::RelayStatus;
 use crate::ui::home::{render_home, HomeAction, HomeState};
 use crate::ui::remote_view::{render_remote_view, RemoteViewAction, RemoteViewState};
+use crate::ui::screen;
 use crate::ui::settings::{render_settings, SettingsState};
 use crate::ui::sysinfo::{spawn_status_poller, SharedSysStatus};
 use crate::ui::theme::{self, c};
@@ -49,6 +50,8 @@ pub struct FlashDeskApp {
     home_state: HomeState,
     settings_state: SettingsState,
     active_session: Option<(ViewerSessionHandle, RemoteViewState)>,
+    /// The window has been checked against the monitor's work area (see `ui::screen`).
+    window_fitted: bool,
 }
 
 impl FlashDeskApp {
@@ -93,6 +96,37 @@ impl FlashDeskApp {
             home_state: HomeState::default(),
             settings_state: SettingsState::default(),
             active_session: None,
+            window_fitted: false,
+        }
+    }
+
+    /// Shrinks / moves the window once at startup so it fits the work area of its monitor
+    /// (eframe only clamps to the whole monitor, ignoring the taskbar and title bar).
+    fn fit_window_to_screen(&mut self, ctx: &egui::Context) {
+        if self.window_fitted {
+            return;
+        }
+        let (outer, inner) = ctx.input(|i| (i.viewport().outer_rect, i.viewport().inner_rect));
+        let (Some(outer), Some(inner)) = (outer, inner) else {
+            return; // not reported yet: try again next frame
+        };
+        self.window_fitted = true;
+        let Some(work) = screen::work_area_points(outer.center(), ctx.pixels_per_point()) else {
+            return;
+        };
+        let fit = screen::fit_window(outer, inner, work, screen::MIN_INNER);
+        ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(fit.min_inner_size));
+        if let Some(size) = fit.inner_size {
+            tracing::info!(
+                "window {:?} does not fit work area {:?}: resizing to {:?}",
+                inner.size(),
+                work,
+                size
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+        }
+        if let Some(pos) = fit.outer_pos {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
         }
     }
 
@@ -219,14 +253,17 @@ fn relay_badge(ui: &mut egui::Ui, st: &RelayStatus, has_identity: bool) {
         (c::WARN, "正在连接中转…".to_string())
     };
     // Painted at an exact size: it sits in the top bar's right-to-left layout, where child
-    // layouts would either reverse (dot after text) or stretch across the whole bar.
-    let galley = egui::WidgetText::from(RichText::new(text).size(13.0).color(c::TEXT_2))
+    // layouts would either reverse (dot after text) or stretch across the whole bar. Long relay
+    // names are truncated so the badge never pushes into the tabs on narrow windows.
+    let max_text_w = (ui.available_width() - 44.0).clamp(40.0, 260.0);
+    let galley = egui::WidgetText::from(RichText::new(text.clone()).size(13.0).color(c::TEXT_2))
         .into_galley(
             ui,
-            Some(egui::TextWrapMode::Extend),
-            f32::INFINITY,
+            Some(egui::TextWrapMode::Truncate),
+            max_text_w,
             egui::TextStyle::Body,
         );
+    let truncated = galley.elided;
     let size = egui::vec2(12.0 + 10.0 + 8.0 + galley.size().x + 14.0, 28.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter();
@@ -244,6 +281,8 @@ fn relay_badge(ui: &mut egui::Ui, st: &RelayStatus, has_identity: bool) {
     painter.galley(text_pos, galley, c::TEXT_2);
     if let Some(err) = st.error.as_deref().filter(|_| !st.connected) {
         resp.on_hover_text(err);
+    } else if truncated {
+        resp.on_hover_text(text);
     }
 }
 
@@ -268,6 +307,8 @@ fn content_column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 
 impl eframe::App for FlashDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.fit_window_to_screen(ctx);
+
         if let Some((session, view_state)) = &mut self.active_session {
             match render_remote_view(ctx, view_state, session) {
                 RemoteViewAction::Disconnect => {

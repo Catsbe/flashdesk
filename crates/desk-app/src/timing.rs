@@ -53,16 +53,24 @@ mod tests {
         for _ in 0..6 {
             sleep_until(Instant::now() + Duration::from_millis(25));
         }
-        let mut misses = Vec::new();
-        for ms in [1u64, 3, 5, 8, 12, 16] {
-            let deadline = Instant::now() + Duration::from_millis(ms);
-            sleep_until(deadline);
-            misses.push(Instant::now() - deadline);
+        // The other tests run in parallel (the colour-conversion ones use every core), so on a
+        // small VM this thread can be preempted for a few ms at a time. Allow a few rounds: a
+        // real regression -- waking on the 10-15 ms OS tick -- misses in every one of them.
+        let mut rounds = Vec::new();
+        for _ in 0..3 {
+            let mut misses = Vec::new();
+            for ms in [1u64, 3, 5, 8, 12, 16] {
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                sleep_until(deadline);
+                misses.push(Instant::now() - deadline);
+            }
+            misses.sort();
+            // Median: robust to one preemption. The point is "not a 10-15 ms OS tick".
+            if misses[misses.len() / 2] < Duration::from_millis(3) {
+                return;
+            }
+            rounds.push(misses);
         }
-        misses.sort();
-        // Median: robust to one preemption on a loaded test machine. The point is "not a
-        // 10-15 ms OS tick".
-        let median = misses[misses.len() / 2];
-        assert!(median < Duration::from_millis(3), "overshoots {misses:?}");
+        panic!("overshoots in every round: {rounds:?}");
     }
 }

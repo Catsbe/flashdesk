@@ -281,16 +281,35 @@ pub fn card_header(
     right: impl FnOnce(&mut Ui),
 ) {
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(title(heading));
-            if let Some(sub) = subtitle {
-                ui.label(muted(sub));
-            }
+        // Right-hand widgets first, so on narrow windows the subtitle wraps in the space that
+        // is left instead of running underneath them.
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+            right(ui);
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(title(heading));
+                if let Some(sub) = subtitle {
+                    ui.add(egui::Label::new(muted(sub)).wrap());
+                }
+            });
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), right);
     });
     ui.add_space(6.0);
+}
+
+/// Secondary note at the end of a row. Truncated with "…" (full text on hover) when the window
+/// is narrow, instead of making the row wider than the page.
+pub fn hint(ui: &mut Ui, text: &str) -> Response {
+    ui.add(egui::Label::new(faint(text)).truncate())
+}
+
+/// Label no wider than `max_width`; longer text is truncated with "…" (full text on hover).
+pub fn label_max_width(ui: &mut Ui, text: impl Into<WidgetText>, max_width: f32) -> Response {
+    ui.scope(|ui| {
+        ui.set_max_width(max_width.max(24.0));
+        ui.add(egui::Label::new(text).truncate())
+    })
+    .inner
 }
 
 /// Thin horizontal divider with breathing room.
@@ -530,16 +549,24 @@ fn lerp(a: u8, b: u8, t: f32) -> u8 {
 // Small display widgets
 // ---------------------------------------------------------------------------------------------
 
-/// Rounded pill label.
+/// Rounded pill label. Painted at an exact size (not a `Frame`), so a row of chips can wrap
+/// in `horizontal_wrapped` on narrow windows.
 pub fn chip(ui: &mut Ui, text: impl Into<String>, fg: Color32, bg: Color32) -> Response {
-    Frame::new()
-        .fill(bg)
-        .corner_radius(CornerRadius::same(255))
-        .inner_margin(Margin::symmetric(9, 3))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(12.5).color(fg));
-        })
-        .response
+    let galley = WidgetText::from(RichText::new(text).size(12.5).color(fg)).into_galley(
+        ui,
+        Some(TextWrapMode::Extend),
+        f32::INFINITY,
+        TextStyle::Body,
+    );
+    let size = vec2(galley.size().x + 18.0, (galley.size().y + 6.0).max(22.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(255), bg);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, fg);
+    }
+    resp
 }
 
 /// Neutral chip (grey on dark).
@@ -899,7 +926,7 @@ pub fn toast_area(ctx: &egui::Context, slot: &mut Option<Toast>) {
                     color: Color32::from_black_alpha(150),
                 })
                 .show(ui, |ui| {
-                    ui.set_max_width(620.0);
+                    ui.set_max_width((ctx.screen_rect().width() - 80.0).clamp(200.0, 620.0));
                     ui.horizontal(|ui| {
                         status_dot(ui, fg);
                         ui.add(egui::Label::new(RichText::new(&toast.text).color(c::TEXT)).wrap());

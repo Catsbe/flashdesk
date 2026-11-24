@@ -110,13 +110,14 @@ fn identity_card(
                     ui.ctx().copy_text(toml_text);
                     toast(ui, state, Tone::Ok, "已复制完整 relay.toml，粘贴到云服务器即可");
                 }
-                ui.label(theme::faint("包含根公钥与吊销名单"));
+                theme::hint(ui, "包含根公钥与吊销名单");
             });
 
             theme::divider(ui);
             ui.label(theme::subheading("为新电脑签发配置包"));
             ui.horizontal(|ui| {
-                theme::text_input(ui, &mut state.issue_device_name, 200.0, "设备名称，如 办公电脑");
+                let name_w = (ui.available_width() - 270.0).clamp(110.0, 200.0);
+                theme::text_input(ui, &mut state.issue_device_name, name_w, "设备名称，如 办公电脑");
                 if theme::button(ui, "保存为 .fdesk 文件", Kind::Primary).clicked() {
                     let name = state.issue_device_name.trim().to_string();
                     if name.is_empty() {
@@ -235,11 +236,18 @@ fn identity_card(
     });
 }
 
+/// Relay table column widths: fixed ID / role / action columns, the name and address inputs
+/// share whatever the card has left, so the table never runs past the card on small windows.
+const NODE_ID_W: f32 = 84.0;
+const NODE_ROLE_W: f32 = 104.0;
+const NODE_ACTION_W: f32 = 54.0;
+const NODE_GRID_GAP: f32 = 10.0;
+
 fn role_combo(ui: &mut egui::Ui, id: &str, role: &mut RelayNodeRole) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt(id)
         .selected_text(role.label())
-        .width(116.0)
+        .width(NODE_ROLE_W)
         .show_ui(ui, |ui| {
             for r in [
                 RelayNodeRole::PrimaryControl,
@@ -271,9 +279,11 @@ fn relays_card(
         };
 
         let mut remove_idx = None;
+        let fixed = NODE_ID_W + NODE_ROLE_W + NODE_ACTION_W + 4.0 * NODE_GRID_GAP;
+        let field_w = ((ui.available_width() - fixed) / 2.0).clamp(96.0, 220.0);
         egui::Grid::new("relay_nodes_grid")
             .num_columns(5)
-            .spacing([10.0, 8.0])
+            .spacing([NODE_GRID_GAP, 8.0])
             .show(ui, |ui| {
                 for h in ["ID", "名称", "地址 (IP:端口)", "用途", ""] {
                     ui.label(theme::faint(h));
@@ -281,9 +291,9 @@ fn relays_card(
                 ui.end_row();
 
                 for (idx, node) in bundle.relay_nodes.iter_mut().enumerate() {
-                    ui.label(theme::mono(&node.id));
-                    let r1 = theme::text_input(ui, &mut node.name, 200.0, "名称");
-                    let r2 = theme::text_input(ui, &mut node.addr, 190.0, "1.2.3.4:19443");
+                    theme::label_max_width(ui, theme::mono(&node.id), NODE_ID_W);
+                    let r1 = theme::text_input(ui, &mut node.name, field_w, "名称");
+                    let r2 = theme::text_input(ui, &mut node.addr, field_w, "1.2.3.4:19443");
                     if theme::committed(&r1) || theme::committed(&r2) {
                         *changed = true;
                     }
@@ -296,9 +306,9 @@ fn relays_card(
                     ui.end_row();
                 }
 
-                theme::text_input(ui, &mut state.new_node_id, 110.0, "新节点 ID");
-                theme::text_input(ui, &mut state.new_node_name, 200.0, "名称，如 香港 1G");
-                theme::text_input(ui, &mut state.new_node_addr, 190.0, "1.2.3.4:19443");
+                theme::text_input(ui, &mut state.new_node_id, NODE_ID_W, "新节点 ID");
+                theme::text_input(ui, &mut state.new_node_name, field_w, "名称，如 香港 1G");
+                theme::text_input(ui, &mut state.new_node_addr, field_w, "1.2.3.4:19443");
                 role_combo(ui, "new_node_role", &mut state.new_node_role);
                 if theme::small_button(ui, "添加", Kind::Secondary).clicked() {
                     let id = state.new_node_id.trim().to_string();
@@ -359,7 +369,7 @@ fn stream_card(ui: &mut egui::Ui, conf: &mut AppConfig, changed: &mut bool) {
             if resp.drag_stopped() || resp.lost_focus() || (resp.changed() && !resp.dragged()) {
                 *changed = true;
             }
-            ui.label(theme::faint("自适应码率的上限，网络变差时自动下调"));
+            theme::hint(ui, "自适应码率的上限，网络变差时自动下调");
         });
         theme::form_row(ui, "分辨率上限", |ui| {
             if theme::segmented(
@@ -369,7 +379,7 @@ fn stream_card(ui: &mut egui::Ui, conf: &mut AppConfig, changed: &mut bool) {
             ) {
                 *changed = true;
             }
-            ui.label(theme::faint("2K / 4K 屏走 5M 小带宽中转建议 1080p"));
+            theme::hint(ui, "2K / 4K 屏走 5M 小带宽中转建议 1080p");
         });
 
         let relay_list = conf
@@ -416,7 +426,7 @@ fn stream_card(ui: &mut egui::Ui, conf: &mut AppConfig, changed: &mut bool) {
             if resp.drag_stopped() || resp.lost_focus() {
                 *changed = true;
             }
-            ui.label(theme::faint("局域网直连使用的 TCP 端口，修改后重启 FlashDesk 生效"));
+            theme::hint(ui, "局域网直连使用的 TCP 端口，修改后重启 FlashDesk 生效");
         });
     });
 }
@@ -440,7 +450,7 @@ fn unattended_card(
         let (dot, text) = service_summary(sys);
         theme::form_row(ui, "系统服务", |ui| {
             theme::status_dot(ui, dot);
-            ui.label(RichText::new(text).color(c::TEXT))
+            ui.add(egui::Label::new(RichText::new(text).color(c::TEXT)).wrap())
                 .on_hover_text(sys.service.label());
         });
         theme::form_row(ui, "", |ui| {
@@ -480,44 +490,47 @@ fn unattended_card(
             ui.add(egui::Label::new(RichText::new(&sys.vdd_details).color(c::TEXT)).wrap());
         });
         theme::form_row(ui, "", |ui| {
-            let mut vdd = |ui: &mut egui::Ui, label: &str, req: VddRequest| {
-                if theme::small_button(ui, label, Kind::Secondary).clicked() {
-                    match handle_vdd_request(&req) {
-                        Ok(info) => toast(ui, state, Tone::Ok, format!("虚拟屏状态：{}", info.details)),
-                        Err(e) => toast(
-                            ui,
-                            state,
-                            Tone::Danger,
-                            format!("操作失败（需先安装虚拟显示驱动）：{e}"),
-                        ),
+            // Wraps onto a second line on narrow windows.
+            ui.horizontal_wrapped(|ui| {
+                let mut vdd = |ui: &mut egui::Ui, label: &str, req: VddRequest| {
+                    if theme::small_button(ui, label, Kind::Secondary).clicked() {
+                        match handle_vdd_request(&req) {
+                            Ok(info) => toast(ui, state, Tone::Ok, format!("虚拟屏状态：{}", info.details)),
+                            Err(e) => toast(
+                                ui,
+                                state,
+                                Tone::Danger,
+                                format!("操作失败（需先安装虚拟显示驱动）：{e}"),
+                            ),
+                        }
                     }
-                }
-            };
-            vdd(
-                ui,
-                "启用 1080P 60Hz",
-                VddRequest::AddDisplay {
-                    width: 1920,
-                    height: 1080,
-                    refresh_hz: 60,
-                },
-            );
-            vdd(
-                ui,
-                "启用 2K 60Hz",
-                VddRequest::AddDisplay {
-                    width: 2560,
-                    height: 1440,
-                    refresh_hz: 60,
-                },
-            );
-            vdd(ui, "移除虚拟屏", VddRequest::RemoveDisplay);
+                };
+                vdd(
+                    ui,
+                    "启用 1080P 60Hz",
+                    VddRequest::AddDisplay {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60,
+                    },
+                );
+                vdd(
+                    ui,
+                    "启用 2K 60Hz",
+                    VddRequest::AddDisplay {
+                        width: 2560,
+                        height: 1440,
+                        refresh_hz: 60,
+                    },
+                );
+                vdd(ui, "移除虚拟屏", VddRequest::RemoveDisplay);
+            });
         });
         theme::form_row(ui, "无显示器时", |ui| {
             if theme::toggle(ui, &mut conf.auto_vdd_on_headless).changed() {
                 *changed = true;
             }
-            ui.label(RichText::new("被控端没有实体显示器时自动创建虚拟屏").color(c::TEXT_2));
+            ui.add(egui::Label::new(RichText::new("被控端没有实体显示器时自动创建虚拟屏").color(c::TEXT_2)).wrap());
         });
         theme::form_row(ui, "驱动下载", |ui| {
             if theme::small_button(ui, "Parsec VDD ↗", Kind::Ghost).clicked() {
@@ -544,7 +557,8 @@ fn revoke_card(
             |_| {},
         );
         ui.horizontal(|ui| {
-            theme::text_input(ui, &mut state.revoke_uuid_input, 340.0, "要吊销的设备 UUID");
+            let uuid_w = (ui.available_width() - 130.0).clamp(160.0, 340.0);
+            theme::text_input(ui, &mut state.revoke_uuid_input, uuid_w, "要吊销的设备 UUID");
             if theme::button(ui, "加入吊销名单", Kind::Danger).clicked() {
                 match Uuid::parse_str(state.revoke_uuid_input.trim()) {
                     Ok(uid) => {

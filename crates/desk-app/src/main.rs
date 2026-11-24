@@ -380,11 +380,14 @@ fn main() -> Result<()> {
     let monitors = enumerate_monitors().unwrap_or_default();
     let cfg = AppConfig::load_or_default(&cfg_path);
 
+    // Small screens: the app shrinks / re-centres the window to the monitor's work area once it
+    // exists (see `ui::screen`), since eframe ignores the taskbar and title bar.
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1060.0, 740.0])
-            .with_min_inner_size([760.0, 520.0])
+            .with_inner_size(ui::screen::DEFAULT_INNER)
+            .with_min_inner_size(ui::screen::MIN_INNER)
             .with_title("FlashDesk — 自建高速远程桌面"),
+        centered: true,
         ..Default::default()
     };
 

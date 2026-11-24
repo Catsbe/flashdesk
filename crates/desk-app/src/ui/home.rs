@@ -127,7 +127,8 @@ fn onboarding_card(
             .wrap(),
         );
         ui.add_space(6.0);
-        ui.horizontal(|ui| {
+        // Wraps onto a second line on narrow windows.
+        ui.horizontal_wrapped(|ui| {
             if theme::button(ui, "生成个人根密钥（主设备）", Kind::Primary).clicked() {
                 conf.init_new_personal_root(default_hostname(), default_relays());
                 *action = HomeAction::ConfigChanged;
@@ -164,7 +165,7 @@ fn onboarding_card(
         if state.show_token_import {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let w = (ui.available_width() - 90.0).clamp(200.0, 520.0);
+                let w = (ui.available_width() - 80.0).clamp(140.0, 520.0);
                 theme::text_input(ui, &mut state.import_token_input, w, "粘贴 Base64 导入码");
                 if theme::button(ui, "导入", Kind::Secondary).clicked() {
                     let token = state.import_token_input.trim().to_string();
@@ -206,36 +207,34 @@ fn this_device_card(
             ui.horizontal(|ui| {
                 theme::avatar(ui, "💻", false);
                 ui.add_space(4.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.label(theme::bold(&dev_name).size(19.0));
-                        theme::chip(ui, "本机", c::ACCENT_HOVER, c::ACCENT_SOFT);
-                    });
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(theme::faint("设备 ID"));
-                        ui.label(theme::mono(format!("{}…", &id_str[..8])))
-                            .on_hover_text(&id_str);
-                        if theme::small_button(ui, "复制", Kind::Ghost).clicked() {
-                            ui.ctx().copy_text(id_str.clone());
-                            toast(ui, state, Tone::Ok, "已复制本机设备 ID");
-                        }
-                        ui.add_space(8.0);
-                        ui.label(theme::faint("局域网直连"));
-                        ui.label(theme::mono(&lan));
-                        if theme::small_button(ui, "复制", Kind::Ghost).clicked() {
-                            ui.ctx().copy_text(lan.clone());
-                            toast(ui, state, Tone::Ok, "已复制局域网直连地址");
-                        }
-                    });
-                });
+                // The switch goes first (right-aligned) so the identity text gets whatever
+                // width is left, instead of running underneath it on narrow windows.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if theme::toggle(ui, &mut conf.allow_incoming).changed() {
                         *action = HomeAction::ConfigChanged;
                     }
                     let hint = if conf.allow_incoming { "允许被远程控制" } else { "已禁止被控" };
                     ui.label(RichText::new(hint).color(c::TEXT_2));
+                    ui.add_space(8.0);
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.horizontal(|ui| {
+                            let name_w = ui.available_width() - 56.0;
+                            theme::label_max_width(ui, theme::bold(&dev_name).size(19.0), name_w);
+                            theme::chip(ui, "本机", c::ACCENT_HOVER, c::ACCENT_SOFT);
+                        });
+                        // ID and LAN address share a line only when both fit.
+                        if ui.available_width() >= 470.0 {
+                            ui.horizontal(|ui| {
+                                id_line(ui, state, &id_str);
+                                ui.add_space(8.0);
+                                lan_line(ui, state, &lan);
+                            });
+                        } else {
+                            ui.horizontal(|ui| id_line(ui, state, &id_str));
+                            ui.horizontal(|ui| lan_line(ui, state, &lan));
+                        }
+                    });
                 });
             });
         } else {
@@ -247,8 +246,7 @@ fn this_device_card(
 
         let (dot, mode_text) = service_summary(sys);
         theme::form_row_w(ui, "运行模式", 96.0, |ui| {
-            theme::status_dot(ui, dot);
-            ui.label(RichText::new(mode_text).color(c::TEXT));
+            // Button first (right-aligned) so a long status wraps instead of sliding under it.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if sys.service != ServiceState::Running {
                     if theme::small_button(ui, "安装系统服务", Kind::Secondary)
@@ -273,35 +271,63 @@ fn this_device_card(
                         Err(e) => toast(ui, state, Tone::Danger, format!("重启失败：{e}")),
                     }
                 }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    theme::status_dot(ui, dot);
+                    ui.add(egui::Label::new(RichText::new(mode_text).color(c::TEXT)).wrap());
+                });
             });
         });
         theme::form_row_w(ui, "虚拟显示器", 96.0, |ui| {
             ui.add(egui::Label::new(RichText::new(&sys.vdd_details).color(c::TEXT)).wrap());
         });
         theme::form_row_w(ui, "编码 / 显示器", 96.0, |ui| {
-            if caps.encode_backends.is_empty() {
-                ui.label(theme::faint("未检测到可用编码器"));
-            }
-            for b in &caps.encode_backends {
-                theme::chip(ui, b, c::ACCENT_HOVER, c::ACCENT_SOFT);
-            }
-            if monitors.is_empty() {
-                ui.label(theme::faint("未检测到显示器"));
-            }
-            for m in monitors {
-                theme::tag(
-                    ui,
-                    format!(
-                        "#{}  {}×{} · {} dpi",
-                        m.info.index + 1,
-                        m.info.width,
-                        m.info.height,
-                        m.info.dpi
-                    ),
-                );
-            }
+            // Several encoders / monitors wrap onto more lines instead of widening the card.
+            ui.horizontal_wrapped(|ui| {
+                if caps.encode_backends.is_empty() {
+                    ui.label(theme::faint("未检测到可用编码器"));
+                }
+                for b in &caps.encode_backends {
+                    theme::chip(ui, b, c::ACCENT_HOVER, c::ACCENT_SOFT);
+                }
+                if monitors.is_empty() {
+                    ui.label(theme::faint("未检测到显示器"));
+                }
+                for m in monitors {
+                    theme::tag(
+                        ui,
+                        format!(
+                            "#{}  {}×{} · {} dpi",
+                            m.info.index + 1,
+                            m.info.width,
+                            m.info.height,
+                            m.info.dpi
+                        ),
+                    );
+                }
+            });
         });
     });
+}
+
+fn id_line(ui: &mut egui::Ui, state: &mut HomeState, id_str: &str) {
+    ui.spacing_mut().item_spacing.x = 6.0;
+    ui.label(theme::faint("设备 ID"));
+    ui.label(theme::mono(format!("{}…", &id_str[..8])))
+        .on_hover_text(id_str);
+    if theme::small_button(ui, "复制", Kind::Ghost).clicked() {
+        ui.ctx().copy_text(id_str.to_string());
+        toast(ui, state, Tone::Ok, "已复制本机设备 ID");
+    }
+}
+
+fn lan_line(ui: &mut egui::Ui, state: &mut HomeState, lan: &str) {
+    ui.spacing_mut().item_spacing.x = 6.0;
+    ui.label(theme::faint("局域网直连"));
+    ui.label(theme::mono(lan));
+    if theme::small_button(ui, "复制", Kind::Ghost).clicked() {
+        ui.ctx().copy_text(lan.to_string());
+        toast(ui, state, Tone::Ok, "已复制局域网直连地址");
+    }
 }
 
 /// Online devices signed by the same root, plus LAN / IP direct connect.
@@ -352,27 +378,35 @@ fn devices_card(
                     ui.horizontal(|ui| {
                         theme::avatar(ui, "🖥", true);
                         ui.add_space(4.0);
-                        ui.vertical(|ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            ui.label(theme::bold(&dev.device_name).size(15.0));
-                            let codecs = if dev.encode_codecs.is_empty() {
-                                "编码未知".to_string()
-                            } else {
-                                dev.encode_codecs
-                                    .iter()
-                                    .map(|c| c.label())
-                                    .collect::<Vec<_>>()
-                                    .join(" / ")
-                            };
-                            ui.label(theme::faint(format!(
-                                "{} · {} 个显示器 · {}",
-                                dev.os, dev.monitor_count, codecs
-                            )));
-                        });
+                        // Button first so long names / details are truncated, not overlapped.
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if theme::button(ui, "连接", Kind::Primary).clicked() {
                                 *action = HomeAction::ConnectRelay(dev.clone());
                             }
+                            ui.add_space(8.0);
+                            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.add(
+                                    egui::Label::new(theme::bold(&dev.device_name).size(15.0))
+                                        .truncate(),
+                                );
+                                let codecs = if dev.encode_codecs.is_empty() {
+                                    "编码未知".to_string()
+                                } else {
+                                    dev.encode_codecs
+                                        .iter()
+                                        .map(|c| c.label())
+                                        .collect::<Vec<_>>()
+                                        .join(" / ")
+                                };
+                                ui.add(
+                                    egui::Label::new(theme::faint(format!(
+                                        "{} · {} 个显示器 · {}",
+                                        dev.os, dev.monitor_count, codecs
+                                    )))
+                                    .truncate(),
+                                );
+                            });
                         });
                     });
                 });
@@ -383,10 +417,12 @@ fn devices_card(
         ui.horizontal(|ui| {
             ui.label(RichText::new("局域网 / IP 直连").color(c::TEXT_2));
             ui.add_space(4.0);
+            // Narrower input on small windows; the note after the button is truncated last.
+            let input_w = (ui.available_width() - 72.0).clamp(120.0, 220.0);
             let resp = theme::text_input(
                 ui,
                 &mut state.direct_addr_input,
-                220.0,
+                input_w,
                 "192.168.1.100:19444",
             );
             let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
@@ -398,7 +434,7 @@ fn devices_card(
                     *action = HomeAction::ConnectDirect(addr);
                 }
             }
-            ui.label(theme::faint("不经过中转，同样端到端加密"));
+            theme::hint(ui, "不经过中转，同样端到端加密");
         });
     });
 }
