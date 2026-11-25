@@ -48,7 +48,7 @@ sudo systemctl status flashdesk-relay
 # 查看实时日志
 sudo journalctl -u flashdesk-relay -f
 
-# 吊销某台丢失设备的权限（编辑 revoked_device_ids 后重启）
+# 吊销某台丢失设备的权限：在主电脑客户端「设置 → 已签发设备与远程吊销」直接点「吊销」即可实时生效（持久化在 /var/lib/flashdesk/revoked.json）；如需手工配置也可编辑 relay.toml 后重启
 sudo nano /etc/flashdesk/relay.toml
 sudo systemctl restart flashdesk-relay
 

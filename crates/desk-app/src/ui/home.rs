@@ -22,6 +22,7 @@ pub enum HomeAction {
 }
 
 pub struct HomeState {
+    pub onboarding_relay_addr: String,
     pub direct_addr_input: String,
     pub import_token_input: String,
     pub show_token_import: bool,
@@ -31,6 +32,7 @@ pub struct HomeState {
 impl Default for HomeState {
     fn default() -> Self {
         Self {
+            onboarding_relay_addr: "127.0.0.1:9442".into(),
             direct_addr_input: "192.168.1.100:19444".into(),
             import_token_input: String::new(),
             show_token_import: false,
@@ -99,11 +101,11 @@ pub fn render_home(
     if conf.bundle.is_some() {
         this_device_card(ui, state, cfg_path, &mut conf, caps, monitors, sys, &mut action);
         theme::gap(ui);
-        devices_card(ui, state, &conf, &st, relay_cmd_tx, &mut action);
+        devices_card(ui, state, cfg_path, &conf, &st, relay_cmd_tx, &mut action);
         theme::gap(ui);
         relay_card(ui, &mut conf, &st, &mut action);
     } else {
-        onboarding_card(ui, state, &mut conf, &mut action);
+        onboarding_card(ui, state, cfg_path, &mut conf, &mut action);
         theme::gap(ui);
         this_device_card(ui, state, cfg_path, &mut conf, caps, monitors, sys, &mut action);
     }
@@ -120,6 +122,7 @@ fn toast(ui: &egui::Ui, state: &mut HomeState, tone: Tone, text: impl Into<Strin
 fn onboarding_card(
     ui: &mut egui::Ui,
     state: &mut HomeState,
+    cfg_path: &Path,
     conf: &mut AppConfig,
     action: &mut HomeAction,
 ) {
@@ -127,32 +130,53 @@ fn onboarding_card(
         ui.label(theme::h1("开始使用 FlashDesk"));
         ui.add(
             egui::Label::new(theme::muted(
-                "每台电脑都需要由你的个人根密钥签发的身份：第一台电脑在这里生成根密钥，\
-                 其它电脑导入它签发的 .fdesk 配置包或导入码。",
+                "只需在主电脑生成 1 次个人根密钥（固定存放在 ~/.flashdesk/，换 exe 不丢失），\
+                 之后其它电脑或手机导入主电脑生成的 .fdesk 文件 / fdesk:// 短码即可直接绑定。",
             ))
             .wrap(),
         );
         ui.add_space(6.0);
-        // Wraps onto a second line on narrow windows.
         ui.horizontal_wrapped(|ui| {
-            if theme::button(ui, "生成个人根密钥（主设备）", Kind::Primary).clicked() {
-                conf.init_new_personal_root(default_hostname(), default_relays());
-                *action = HomeAction::ConfigChanged;
-                toast(
-                    ui,
-                    state,
-                    Tone::Ok,
-                    "已生成个人根密钥并激活本机身份。请到「设置」填入你的中转服务器地址。",
-                );
+            ui.label(RichText::new("中转服务器").color(c::TEXT_2));
+            let addr_w = (ui.available_width() - 230.0).clamp(150.0, 240.0);
+            theme::text_input(
+                ui,
+                &mut state.onboarding_relay_addr,
+                addr_w,
+                "云服务器IP:9442",
+            );
+            if theme::button(ui, "初始化主电脑（生成根密钥）", Kind::Primary).clicked() {
+                let addr = state.onboarding_relay_addr.trim();
+                let mut relays = default_relays();
+                if !addr.is_empty() {
+                    if let Some(first) = relays.first_mut() {
+                        first.addr = addr.to_string();
+                    }
+                }
+                match conf.init_new_personal_root(cfg_path, default_hostname(), relays) {
+                    Ok(()) => {
+                        *action = HomeAction::ConfigChanged;
+                        toast(
+                            ui,
+                            state,
+                            Tone::Ok,
+                            "已生成个人根密钥（~/.flashdesk/root.key），可到「设置」复制服务器公钥与添加设备",
+                        );
+                    }
+                    Err(e) => toast(ui, state, Tone::Danger, format!("初始化失败：{e}")),
+                }
             }
-            if theme::button(ui, "导入 .fdesk 配置包", Kind::Secondary).clicked() {
+        });
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            if theme::button(ui, "导入 .fdesk 文件", Kind::Secondary).clicked() {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("FlashDesk 配置包", &["fdesk", "json"])
                     .pick_file()
                 {
                     match std::fs::read_to_string(&path)
                         .map_err(anyhow::Error::from)
-                        .and_then(|s| Ok(DeviceBundle::from_json_str(&s)?))
+                        .and_then(|s| Ok(DeviceBundle::from_any_str(&s)?))
                     {
                         Ok(bundle) => {
                             conf.import_bundle(bundle);
@@ -163,26 +187,32 @@ fn onboarding_card(
                     }
                 }
             }
-            let label = if state.show_token_import { "收起导入码" } else { "粘贴导入码" };
+            let label = if state.show_token_import { "收起导入码" } else { "粘贴绑定短码" };
             if theme::button(ui, label, Kind::Ghost).clicked() {
                 state.show_token_import = !state.show_token_import;
             }
+            theme::hint(ui, "也可直接把 .fdesk 文件拖进窗口");
         });
         if state.show_token_import {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 80.0).clamp(140.0, 520.0);
-                theme::text_input(ui, &mut state.import_token_input, w, "粘贴 Base64 导入码");
+                theme::text_input(
+                    ui,
+                    &mut state.import_token_input,
+                    w,
+                    "粘贴 fdesk://v2/... 短码或导入码",
+                );
                 if theme::button(ui, "导入", Kind::Secondary).clicked() {
                     let token = state.import_token_input.trim().to_string();
-                    match DeviceBundle::from_b64_token(&token) {
-                        _ if token.is_empty() => toast(ui, state, Tone::Warn, "请先粘贴导入码"),
+                    match DeviceBundle::from_any_str(&token) {
+                        _ if token.is_empty() => toast(ui, state, Tone::Warn, "请先粘贴绑定短码"),
                         Ok(bundle) => {
                             conf.import_bundle(bundle);
                             state.import_token_input.clear();
                             state.show_token_import = false;
                             *action = HomeAction::ConfigChanged;
-                            toast(ui, state, Tone::Ok, "导入码已生效");
+                            toast(ui, state, Tone::Ok, "绑定凭证已生效");
                         }
                         Err(e) => toast(ui, state, Tone::Danger, format!("导入码无效：{e}")),
                     }
@@ -208,7 +238,7 @@ fn this_device_card(
     theme::card(ui, |ui| {
         if let Some(bundle) = &conf.bundle {
             let id_str = bundle.identity.cert.device_id.to_string();
-            let dev_name = bundle.identity.cert.device_name.clone();
+            let dev_name = conf.display_device_name();
             let lan = format!("{}:{}", sys.lan_ip, conf.direct_listen_port);
             ui.horizontal(|ui| {
                 theme::avatar(ui, "💻", false);
@@ -349,12 +379,14 @@ fn lan_line(ui: &mut egui::Ui, state: &mut HomeState, lan: &str) {
 fn devices_card(
     ui: &mut egui::Ui,
     state: &mut HomeState,
+    cfg_path: &Path,
     conf: &AppConfig,
     st: &RelayStatus,
     relay_cmd_tx: &mpsc::UnboundedSender<RelayCommand>,
     action: &mut HomeAction,
 ) {
     let self_id = conf.bundle.as_ref().map(|b| b.identity.cert.device_id);
+    let has_root = conf.has_root_key(cfg_path);
     let others: Vec<&OnlineDevice> = st
         .devices
         .iter()
@@ -369,6 +401,9 @@ fn devices_card(
             |ui| {
                 if theme::small_button(ui, "刷新", Kind::Ghost).clicked() {
                     let _ = relay_cmd_tx.send(RelayCommand::RefreshDevices);
+                }
+                if has_root && theme::small_button(ui, "添加设备", Kind::Secondary).clicked() {
+                    *action = HomeAction::GoToSettings;
                 }
             },
         );

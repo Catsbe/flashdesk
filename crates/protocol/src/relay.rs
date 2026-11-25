@@ -106,6 +106,8 @@ pub enum PresenceClientMsg {
     },
     ListDevices,
     Heartbeat(u64),
+    SyncRevocations(crate::auth::RevocationCommand),
+    SetDisplayName(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,4 +121,8 @@ pub enum PresenceServerMsg {
     },
     HeartbeatAck(u64),
     Error(String),
+    RevocationsSynced {
+        count: usize,
+        issued_at: u64,
+    },
 }

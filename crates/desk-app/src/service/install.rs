@@ -103,11 +103,22 @@ pub fn query_service_state() -> ServiceState {
 }
 
 pub fn sync_config_file_to_program_data(source_cfg: &Path) -> Result<PathBuf> {
+    let text = std::fs::read_to_string(source_cfg).with_context(|| {
+        format!("读取配置 {} 失败", source_cfg.display())
+    })?;
+    let parsed: crate::config::AppConfig = serde_json::from_str(&text).with_context(|| {
+        format!("解析配置 {} 失败", source_cfg.display())
+    })?;
+    anyhow::ensure!(
+        parsed.bundle.is_some(),
+        "拒绝同步空白配置到系统服务：请先初始化根密钥或导入设备配置包"
+    );
+
     let dst = PathBuf::from(SHARED_CONFIG_PATH);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    if source_cfg != dst && source_cfg.exists() {
+    if source_cfg != dst {
         std::fs::copy(source_cfg, &dst).with_context(|| {
             format!(
                 "复制配置 {} -> {} 失败",

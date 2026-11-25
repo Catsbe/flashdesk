@@ -99,7 +99,7 @@ async fn handle_connection(
     .await
     .map_err(|_| anyhow::anyhow!("auth handshake timeout from {peer_addr}"))??;
 
-    let revoked = state.revoked_ids.read().await.clone();
+    let revoked = state.effective_revoked_ids().await;
     if let Err(e) = auth_req.verify(&state.root_pubkey, &nonce, &revoked, unix_timestamp_secs()) {
         warn!("rejected unauthenticated client {}: {}", peer_addr, e);
         let resp = bincode::serialize(&RelayAuthResponse::Rejected(e.to_string()))?;
@@ -192,7 +192,7 @@ async fn handle_presence(
         decode_codecs: Vec::new(),
         os: "unknown".into(),
     };
-    let conn_seq = state.register_peer(initial_info, tx.clone()).await;
+    let (conn_seq, kick_notify) = state.register_peer(initial_info, tx.clone()).await;
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -208,49 +208,116 @@ async fn handle_presence(
         }
     });
 
-    let res = loop {
-        match tokio::time::timeout(PRESENCE_IDLE_TIMEOUT, read_frame(&mut reader)).await {
-            Ok(Ok(raw)) => {
-                let msg: PresenceClientMsg = match bincode::deserialize(&raw) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        break Err(anyhow::anyhow!("invalid presence msg: {e}"));
+    // Dedicated cancel-safe reader task so tokio::select! (kick_notify / idle timeout) never
+    // drops read_frame mid-frame.
+    let (in_tx, mut in_rx) = mpsc::channel::<Result<Vec<u8>, String>>(128);
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match read_frame(&mut reader).await {
+                Ok(raw) => {
+                    if in_tx.send(Ok(raw)).await.is_err() {
+                        break;
                     }
-                };
-                match msg {
-                    PresenceClientMsg::UpdateInfo {
-                        monitor_count,
-                        encode_codecs,
-                        decode_codecs,
-                        os,
-                        accept_incoming,
-                    } => {
-                        state
-                            .update_peer_info(
-                                &device_id,
-                                conn_seq,
+                }
+                Err(e) => {
+                    let _ = in_tx.send(Err(e.to_string())).await;
+                    break;
+                }
+            }
+        }
+    });
+
+    let idle_deadline = tokio::time::sleep(PRESENCE_IDLE_TIMEOUT);
+    tokio::pin!(idle_deadline);
+
+    let res = loop {
+        tokio::select! {
+            _ = kick_notify.notified() => {
+                break Err(anyhow::anyhow!("device revoked by root authority"));
+            }
+            _ = &mut idle_deadline => {
+                break Err(anyhow::anyhow!("presence idle timeout"));
+            }
+            opt = in_rx.recv() => {
+                match opt {
+                    Some(Ok(raw)) => {
+                        idle_deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + PRESENCE_IDLE_TIMEOUT);
+                        let msg: PresenceClientMsg = match bincode::deserialize(&raw) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                break Err(anyhow::anyhow!("invalid presence msg: {e}"));
+                            }
+                        };
+                        match msg {
+                            PresenceClientMsg::UpdateInfo {
                                 monitor_count,
                                 encode_codecs,
                                 decode_codecs,
                                 os,
                                 accept_incoming,
-                            )
-                            .await;
+                            } => {
+                                state
+                                    .update_peer_info(
+                                        &device_id,
+                                        conn_seq,
+                                        monitor_count,
+                                        encode_codecs,
+                                        decode_codecs,
+                                        os,
+                                        accept_incoming,
+                                    )
+                                    .await;
+                            }
+                            PresenceClientMsg::ListDevices => {
+                                let list = state.snapshot_devices().await;
+                                let _ = tx.try_send(PresenceServerMsg::DeviceList(list));
+                            }
+                            PresenceClientMsg::Heartbeat(seq) => {
+                                let _ = tx.try_send(PresenceServerMsg::HeartbeatAck(seq));
+                            }
+                            PresenceClientMsg::SyncRevocations(cmd) => {
+                                match state
+                                    .apply_revocation_command(&cmd, unix_timestamp_secs())
+                                    .await
+                                {
+                                    Ok((count, issued_at)) => {
+                                        info!(
+                                            "revocations synced by {} ({}): {} entries",
+                                            device_name, device_id, count
+                                        );
+                                        let _ = tx.try_send(PresenceServerMsg::RevocationsSynced {
+                                            count,
+                                            issued_at,
+                                        });
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "rejected revocation sync from {} ({}): {}",
+                                            device_name, device_id, e
+                                        );
+                                        let _ = tx.try_send(PresenceServerMsg::Error(format!(
+                                            "同步吊销名单失败: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            PresenceClientMsg::SetDisplayName(name) => {
+                                state
+                                    .update_peer_display_name(&device_id, conn_seq, name)
+                                    .await;
+                            }
+                        }
                     }
-                    PresenceClientMsg::ListDevices => {
-                        let list = state.snapshot_devices().await;
-                        let _ = tx.try_send(PresenceServerMsg::DeviceList(list));
-                    }
-                    PresenceClientMsg::Heartbeat(seq) => {
-                        let _ = tx.try_send(PresenceServerMsg::HeartbeatAck(seq));
-                    }
+                    Some(Err(e)) => break Err(anyhow::anyhow!("presence read closed: {e}")),
+                    None => break Err(anyhow::anyhow!("presence read channel closed")),
                 }
             }
-            Ok(Err(e)) => break Err(anyhow::anyhow!("presence read closed: {e}")),
-            Err(_) => break Err(anyhow::anyhow!("presence idle timeout")),
         }
     };
 
+    reader_task.abort();
     writer_task.abort();
     state.unregister_peer(&device_id, conn_seq).await;
     info!("device offline: {} ({})", device_name, device_id);

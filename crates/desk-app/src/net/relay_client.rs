@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 pub enum RelayCommand {
     ReloadConfig(AppConfig),
     RefreshDevices,
+    SyncRevocations(protocol::auth::RevocationCommand),
 }
 
 pub fn spawn_relay_manager(
@@ -47,7 +48,8 @@ pub fn spawn_relay_manager(
                         cfg = new_cfg;
                         continue;
                     }
-                    Some(RelayCommand::RefreshDevices) => continue,
+                    Some(RelayCommand::RefreshDevices)
+                    | Some(RelayCommand::SyncRevocations(_)) => continue,
                     None => break,
                 }
             };
@@ -60,7 +62,8 @@ pub fn spawn_relay_manager(
                         cfg = new_cfg;
                         continue;
                     }
-                    Some(RelayCommand::RefreshDevices) => continue,
+                    Some(RelayCommand::RefreshDevices)
+                    | Some(RelayCommand::SyncRevocations(_)) => continue,
                     None => break,
                 }
             };
@@ -85,6 +88,7 @@ pub fn spawn_relay_manager(
                     continue;
                 }
                 PresenceOutcome::Disconnected(err) => {
+                    tracing::warn!("relay disconnected from {} ({}): {}", node.name, node.addr, err);
                     update_status_offline(&status, Some(&node), Some(err));
                     repaint();
                     tokio::select! {
@@ -92,7 +96,8 @@ pub fn spawn_relay_manager(
                         cmd = rx.recv() => {
                             match cmd {
                                 Some(RelayCommand::ReloadConfig(new_cfg)) => cfg = new_cfg,
-                                Some(RelayCommand::RefreshDevices) => {}
+                                Some(RelayCommand::RefreshDevices)
+                                | Some(RelayCommand::SyncRevocations(_)) => {}
                                 None => break,
                             }
                         }
@@ -155,6 +160,7 @@ async fn run_presence_once(
         st.relay_addr = node.addr.clone();
         st.error = None;
     }
+    tracing::info!("relay connected: {} ({})", node.name, node.addr);
     repaint();
 
     let (mut reader, mut writer) = stream.into_split();
@@ -177,6 +183,17 @@ async fn run_presence_once(
     if let Ok(bytes) = bincode::serialize(&update_msg) {
         if write_frame(&mut writer, &bytes).await.is_err() {
             return PresenceOutcome::Disconnected("发送设备信息失败".into());
+        }
+    }
+    if let Ok(bytes) = bincode::serialize(&PresenceClientMsg::SetDisplayName(
+        cfg.display_device_name(),
+    )) {
+        let _ = write_frame(&mut writer, &bytes).await;
+    }
+    if let Some(rev_cmd) = &cfg.last_revocation_cmd {
+        if let Ok(bytes) = bincode::serialize(&PresenceClientMsg::SyncRevocations(rev_cmd.clone()))
+        {
+            let _ = write_frame(&mut writer, &bytes).await;
         }
     }
     if let Ok(bytes) = bincode::serialize(&PresenceClientMsg::ListDevices) {
@@ -221,6 +238,15 @@ async fn run_presence_once(
                     Some(RelayCommand::RefreshDevices) => {
                         if let Ok(bytes) = bincode::serialize(&PresenceClientMsg::ListDevices) {
                             let _ = write_frame(&mut writer, &bytes).await;
+                        }
+                    }
+                    Some(RelayCommand::SyncRevocations(rev_cmd)) => {
+                        if let Ok(bytes) =
+                            bincode::serialize(&PresenceClientMsg::SyncRevocations(rev_cmd))
+                        {
+                            if write_frame(&mut writer, &bytes).await.is_err() {
+                                return PresenceOutcome::Disconnected("同步吊销列表发送失败".into());
+                            }
                         }
                     }
                     None => return PresenceOutcome::Exit,
@@ -364,6 +390,10 @@ async fn run_presence_once(
                     }
                     PresenceServerMsg::Error(e) => {
                         status.lock().unwrap().error = Some(e);
+                        repaint();
+                    }
+                    PresenceServerMsg::RevocationsSynced { count, issued_at } => {
+                        status.lock().unwrap().last_revocation_sync = Some((count, issued_at));
                         repaint();
                     }
                 }

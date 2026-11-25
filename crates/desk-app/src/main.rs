@@ -344,6 +344,10 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    let Some(_single_instance) = ui::tray::try_acquire_gui_instance() else {
+        return Ok(());
+    };
+
     let cfg_path = cli.config.unwrap_or_else(AppConfig::resolve_path);
     let cfg_path_panic = cfg_path.clone();
     let prev_hook = std::panic::take_hook();
@@ -391,7 +395,7 @@ fn main() -> Result<()> {
                 width: 32,
                 height: 32,
             })
-            .with_title("FlashDesk — 自建高速远程桌面"),
+            .with_title(ui::tray::MAIN_WINDOW_TITLE),
         centered: true,
         ..Default::default()
     };

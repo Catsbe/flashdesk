@@ -10,34 +10,108 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{BOOL, FALSE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, FALSE, HANDLE, HWND, LPARAM, LRESULT,
+    POINT, TRUE, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateBitmap, CreateDIBSection, DeleteObject, GetDC, ReleaseDC, BITMAPV5HEADER, BI_BITFIELDS,
     DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DestroyWindow, DispatchMessageW, EnumThreadWindows, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, GetWindowTextW, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SetForegroundWindow, SetMenuDefaultItem, SetWindowLongPtrW, ShowWindow,
-    TrackPopupMenu, TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HICON, ICONINFO,
-    IDI_APPLICATION, IsWindow, IsWindowVisible, MF_SEPARATOR, MF_STRING, MSG, SW_RESTORE, SW_SHOW,
-    SW_SHOWNA, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE,
-    WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    AllowSetForegroundWindow, AppendMenuW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EnumThreadWindows,
+    FindWindowW, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowTextW, LoadIconW,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetMenuDefaultItem, SetWindowLongPtrW, ShowWindow, TrackPopupMenu, TranslateMessage, ASFW_ANY,
+    CREATESTRUCTW, GWLP_USERDATA, HICON, ICONINFO, IDI_APPLICATION, IsWindow, IsWindowVisible,
+    MF_SEPARATOR, MF_STRING, MSG, SW_RESTORE, SW_SHOW, SW_SHOWNA, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TRAY_ICON_UID: u32 = 1;
 const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
 const WM_TRAY_SHUTDOWN: u32 = WM_APP + 2;
+const WM_TRAY_SHOW_MAIN: u32 = WM_APP + 3;
 const MENU_ID_SHOW: u32 = 1001;
 const MENU_ID_QUIT: u32 = 1002;
 const TRAY_TIP: &str = "FlashDesk — 远程桌面（点击打开窗口）";
+const SINGLE_INSTANCE_MUTEX: &str = "Local\\FlashDeskGuiSingleInstance";
+pub const MAIN_WINDOW_TITLE: &str = "FlashDesk — 自建高速远程桌面";
+
+/// Holds the session-scoped named mutex preventing duplicate GUI instances.
+pub struct SingleInstanceGuard(HANDLE);
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() && !self.0.0.is_null() {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+fn try_acquire_named_mutex(name: &str) -> Option<SingleInstanceGuard> {
+    let mut wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let Ok(handle) = CreateMutexW(None, false, PCWSTR(wide.as_mut_ptr())) else {
+            return Some(SingleInstanceGuard(HANDLE::default()));
+        };
+        if GetLastError() == ERROR_ALREADY_EXISTS {
+            let _ = CloseHandle(handle);
+            return None;
+        }
+        Some(SingleInstanceGuard(handle))
+    }
+}
+
+/// Acquires the single-instance GUI mutex. If another GUI instance is already running in this
+/// Windows session, asks it to restore & focus its window and returns `None`.
+pub fn try_acquire_gui_instance() -> Option<SingleInstanceGuard> {
+    if let Some(guard) = try_acquire_named_mutex(SINGLE_INSTANCE_MUTEX) {
+        return Some(guard);
+    }
+    activate_existing_gui_instance();
+    None
+}
+
+fn activate_existing_gui_instance() {
+    let title_w: Vec<u16> = MAIN_WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        for attempt in 0..3 {
+            if let Ok(tray_hwnd) = FindWindowW(w!("FlashDeskTrayWindowClass"), w!("FlashDeskTray"))
+            {
+                if !tray_hwnd.0.is_null() {
+                    let _ = PostMessageW(tray_hwnd, WM_TRAY_SHOW_MAIN, WPARAM(0), LPARAM(0));
+                    return;
+                }
+            }
+            if let Ok(main_hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(title_w.as_ptr())) {
+                if !main_hwnd.0.is_null() {
+                    let _ = ShowWindow(main_hwnd, SW_SHOW);
+                    let _ = ShowWindow(main_hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(main_hwnd);
+                    return;
+                }
+            }
+            if attempt < 2 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
 
 /// Generates a 32x32 RGBA FlashDesk icon (dark rounded badge + teal lightning bolt).
 pub fn build_tray_icon_rgba() -> Vec<u8> {
@@ -368,6 +442,11 @@ unsafe extern "system" fn tray_wnd_proc(
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
+        WM_TRAY_SHOW_MAIN => {
+            let main_raw = state.main_hwnd.load(Ordering::Acquire);
+            restore_main_window(main_raw, &state.egui_ctx);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             if state.icon_added {
                 remove_tray_icon(hwnd);
@@ -557,5 +636,15 @@ mod tests {
         let truncated = encode_tip(&long);
         assert_eq!(truncated[127], 0);
         assert_ne!(truncated[126], 0);
+    }
+
+    #[test]
+    fn single_instance_mutex_blocks_second_acquire_until_dropped() {
+        let name = format!("Local\\FlashDeskTest-{}", uuid::Uuid::new_v4());
+        let first = try_acquire_named_mutex(&name);
+        assert!(first.is_some());
+        assert!(try_acquire_named_mutex(&name).is_none());
+        drop(first);
+        assert!(try_acquire_named_mutex(&name).is_some());
     }
 }

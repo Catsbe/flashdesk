@@ -1,14 +1,18 @@
 use crate::config::{default_hostname, AppConfig};
+use crate::net::relay_client::RelayCommand;
+use crate::net::RelayStatus;
 use crate::service::install::{launch_elevated_service_cmd, ServiceState};
 use crate::ui::home::{default_relays, install_service, service_summary, sync_service_config};
 use crate::ui::sysinfo::SysStatus;
 use crate::ui::theme::{self, c, Kind, Toast, Tone};
 use crate::vdd::{handle_vdd_request, open_url, MTT_VDD_DOWNLOAD_URL, PARSEC_VDD_DOWNLOAD_URL};
-use eframe::egui::{self, Align, Layout, RichText};
-use protocol::auth::{DeviceBundle, RelayNodeConfig, RelayNodeRole, RootKeypair};
+use eframe::egui::{self, pos2, vec2, Align, Color32, CornerRadius, Layout, Rect, RichText, Sense};
+use protocol::auth::{DeviceBundle, RelayNodeConfig, RelayNodeRole};
 use protocol::session::VddRequest;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub struct SettingsState {
@@ -17,7 +21,12 @@ pub struct SettingsState {
     pub new_node_addr: String,
     pub new_node_role: RelayNodeRole,
     pub issue_device_name: String,
-    pub issued_token_preview: String,
+    pub issued_label: String,
+    pub issued_bundle: Option<DeviceBundle>,
+    pub issued_compact_token: String,
+    pub issued_qr_modules: Option<(usize, Vec<bool>)>,
+    pub local_name_input: String,
+    pub local_name_synced_with: String,
     pub revoke_uuid_input: String,
     pub import_token_input: String,
     pub toast: Option<Toast>,
@@ -30,8 +39,13 @@ impl Default for SettingsState {
             new_node_name: String::new(),
             new_node_addr: String::new(),
             new_node_role: RelayNodeRole::PrimaryControl,
-            issue_device_name: "办公电脑".into(),
-            issued_token_preview: String::new(),
+            issue_device_name: String::new(),
+            issued_label: String::new(),
+            issued_bundle: None,
+            issued_compact_token: String::new(),
+            issued_qr_modules: None,
+            local_name_input: String::new(),
+            local_name_synced_with: String::new(),
             revoke_uuid_input: String::new(),
             import_token_input: String::new(),
             toast: None,
@@ -52,12 +66,15 @@ pub fn render_settings(
     state: &mut SettingsState,
     cfg_path: &Path,
     cfg: &Arc<Mutex<AppConfig>>,
+    relay_status: &Arc<Mutex<RelayStatus>>,
+    relay_cmd_tx: &mpsc::UnboundedSender<RelayCommand>,
     sys: &SysStatus,
 ) -> bool {
     let mut changed = false;
     let mut conf = cfg.lock().unwrap();
+    let st = relay_status.lock().unwrap().clone();
 
-    identity_card(ui, state, &mut conf, &mut changed);
+    identity_card(ui, state, cfg_path, &mut conf, &mut changed);
     theme::gap(ui);
     relays_card(ui, state, &mut conf, &mut changed);
     theme::gap(ui);
@@ -65,38 +82,106 @@ pub fn render_settings(
     theme::gap(ui);
     unattended_card(ui, state, cfg_path, &mut conf, sys, &mut changed);
     theme::gap(ui);
-    revoke_card(ui, state, &mut conf, &mut changed);
+    revoke_card(ui, state, cfg_path, &mut conf, &st, relay_cmd_tx, &mut changed);
 
     theme::toast_area(ui.ctx(), &mut state.toast);
     changed
 }
 
+fn build_qr_matrix(token: &str) -> Option<(usize, Vec<bool>)> {
+    let code = qrcode::QrCode::new(token.as_bytes()).ok()?;
+    let width = code.width();
+    let modules = code
+        .to_colors()
+        .into_iter()
+        .map(|col| col == qrcode::Color::Dark)
+        .collect();
+    Some((width, modules))
+}
+
+fn paint_qr_code(ui: &mut egui::Ui, size_pt: f32, width: usize, modules: &[bool]) {
+    let (rect, _) = ui.allocate_exact_size(vec2(size_pt, size_pt), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), Color32::WHITE);
+    if width == 0 || modules.len() < width * width {
+        return;
+    }
+    let quiet = 2.0_f32;
+    let cell = (size_pt / (width as f32 + quiet * 2.0)).max(1.0);
+    let total = cell * (width as f32);
+    let origin = pos2(
+        rect.center().x - total / 2.0,
+        rect.center().y - total / 2.0,
+    );
+    let dark = Color32::from_rgb(16, 20, 26);
+    for y in 0..width {
+        for x in 0..width {
+            if modules[y * width + x] {
+                let r = Rect::from_min_size(
+                    pos2(origin.x + x as f32 * cell, origin.y + y as f32 * cell),
+                    vec2(cell + 0.25, cell + 0.25),
+                );
+                painter.rect_filled(r, 0, dark);
+            }
+        }
+    }
+}
+
 fn identity_card(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
+    cfg_path: &Path,
     conf: &mut AppConfig,
     changed: &mut bool,
 ) {
     theme::card(ui, |ui| {
         theme::card_header(
             ui,
-            "身份与设备授权",
-            Some("个人根密钥 (Ed25519) 为你的每台电脑签发身份，中转服务器只认这把公钥"),
+            "身份与设备绑定",
+            Some("个人根密钥与本机配置固定存放在 ~/.flashdesk/，换用新版 exe 不会丢失"),
             |_| {},
         );
 
-        let root_pub = conf
-            .local_root_secret_b64
-            .as_ref()
-            .and_then(|s| RootKeypair::from_b64(s).ok())
-            .map(|kp| kp.pubkey_b64());
+        let dir_display = cfg_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| cfg_path.display().to_string());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(theme::faint("密钥存储目录"));
+            ui.label(theme::mono(&dir_display));
+        });
 
-        if let Some(pub_b64) = root_pub {
-            ui.label(theme::subheading("中转服务器根公钥"));
+        if conf.bundle.is_some() {
+            let cur_name = conf.display_device_name();
+            if state.local_name_synced_with != cur_name {
+                state.local_name_input = cur_name.clone();
+                state.local_name_synced_with = cur_name;
+            }
+            theme::form_row(ui, "本机显示名称", |ui| {
+                let w = (ui.available_width() - 10.0).clamp(140.0, 240.0);
+                let resp = theme::text_input(ui, &mut state.local_name_input, w, "如 家里电脑");
+                if theme::committed(&resp) {
+                    let trimmed = state.local_name_input.trim().to_string();
+                    if !trimmed.is_empty() && trimmed != conf.display_device_name() {
+                        conf.local_device_name = Some(trimmed.clone());
+                        state.local_name_synced_with = trimmed;
+                        *changed = true;
+                        toast(ui, state, Tone::Ok, "已更新本机显示名称");
+                    }
+                }
+                theme::hint(ui, "修改后按回车，其它设备列表中立即更新");
+            });
+        }
+
+        if let Some(kp) = conf.load_root_keypair(cfg_path) {
+            let pub_b64 = kp.pubkey_b64();
+            ui.add_space(2.0);
+            ui.label(theme::subheading("中转服务器根公钥（仅需在服务器配置一次）"));
             if theme::code_box(ui, &pub_b64) {
                 toast(ui, state, Tone::Ok, "已复制根公钥");
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if theme::small_button(ui, "复制完整 relay.toml", Kind::Secondary).clicked() {
                     let revoked = conf
                         .revoked_device_ids
@@ -110,88 +195,141 @@ fn identity_card(
                     ui.ctx().copy_text(toml_text);
                     toast(ui, state, Tone::Ok, "已复制完整 relay.toml，粘贴到云服务器即可");
                 }
-                theme::hint(ui, "包含根公钥与吊销名单");
+                if theme::small_button(ui, "复制一键部署命令", Kind::Secondary).clicked() {
+                    let port = conf
+                        .active_relay()
+                        .and_then(|r| r.addr.rsplit(':').next())
+                        .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+                        .unwrap_or("9442");
+                    let cmd = format!(
+                        "sudo bash deploy-relay.sh --port {port} --root-pubkey \"{pub_b64}\""
+                    );
+                    ui.ctx().copy_text(cmd);
+                    toast(ui, state, Tone::Ok, "已复制服务器一键部署命令");
+                }
+                theme::hint(ui, "新增电脑 / 手机或吊销设备都无需再修改服务器配置");
             });
 
             theme::divider(ui);
-            ui.label(theme::subheading("为新电脑签发配置包"));
-            ui.horizontal(|ui| {
-                let name_w = (ui.available_width() - 270.0).clamp(110.0, 200.0);
-                theme::text_input(ui, &mut state.issue_device_name, name_w, "设备名称，如 办公电脑");
-                if theme::button(ui, "保存为 .fdesk 文件", Kind::Primary).clicked() {
-                    let name = state.issue_device_name.trim().to_string();
-                    if name.is_empty() {
-                        toast(ui, state, Tone::Warn, "请先填写设备名称");
-                    } else {
-                        match conf.issue_device_bundle(&name, 3650) {
-                            Ok(bundle) => {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .set_file_name(format!("{name}.fdesk"))
-                                    .save_file()
-                                {
-                                    match bundle
-                                        .to_json_pretty()
-                                        .map_err(anyhow::Error::from)
-                                        .and_then(|j| Ok(std::fs::write(&path, j)?))
-                                    {
-                                        Ok(()) => toast(
-                                            ui,
-                                            state,
-                                            Tone::Ok,
-                                            format!("已签发：{}", path.display()),
-                                        ),
-                                        Err(e) => {
-                                            toast(ui, state, Tone::Danger, format!("保存失败：{e}"))
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => toast(ui, state, Tone::Danger, format!("签发失败：{e}")),
-                        }
-                    }
-                }
-                if theme::button(ui, "生成导入码", Kind::Secondary).clicked() {
-                    let name = state.issue_device_name.trim().to_string();
-                    if name.is_empty() {
-                        toast(ui, state, Tone::Warn, "请先填写设备名称");
-                    } else {
-                        match conf
-                            .issue_device_bundle(&name, 3650)
-                            .and_then(|b| Ok(b.to_b64_token()?))
-                        {
+            ui.label(theme::subheading("添加新电脑 / 手机（一次签发，无需改动服务器）"));
+            ui.horizontal_wrapped(|ui| {
+                let name_w = (ui.available_width() - 220.0).clamp(130.0, 230.0);
+                theme::text_input(
+                    ui,
+                    &mut state.issue_device_name,
+                    name_w,
+                    "备注名称（可选，如 手机 / 家里电脑）",
+                );
+                if theme::button(ui, "生成绑定二维码与密钥", Kind::Primary).clicked() {
+                    match conf.issue_device_bundle(cfg_path, &state.issue_device_name, 3650) {
+                        Ok((bundle, record)) => match bundle.to_compact_token() {
                             Ok(token) => {
                                 ui.ctx().copy_text(token.clone());
-                                state.issued_token_preview = token;
-                                toast(ui, state, Tone::Ok, "导入码已生成并复制到剪贴板");
+                                state.issued_qr_modules = build_qr_matrix(&token);
+                                state.issued_label = record.label;
+                                state.issued_bundle = Some(bundle);
+                                state.issued_compact_token = token;
+                                state.issue_device_name.clear();
+                                *changed = true;
+                                toast(ui, state, Tone::Ok, "已生成绑定凭证并复制 fdesk:// 短码");
                             }
-                            Err(e) => toast(ui, state, Tone::Danger, format!("生成失败：{e}")),
-                        }
+                            Err(e) => toast(ui, state, Tone::Danger, format!("编码短码失败：{e}")),
+                        },
+                        Err(e) => toast(ui, state, Tone::Danger, format!("签发失败：{e}")),
                     }
                 }
             });
-            if !state.issued_token_preview.is_empty() {
-                let token = state.issued_token_preview.clone();
-                egui::ScrollArea::vertical()
-                    .id_salt("issued_token_preview")
-                    .max_height(92.0)
-                    .show(ui, |ui| {
-                        if theme::code_box(ui, &token) {
-                            toast(ui, state, Tone::Ok, "已复制导入码");
+
+            if !state.issued_compact_token.is_empty() {
+                let token = state.issued_compact_token.clone();
+                let label = state.issued_label.clone();
+                let qr = state.issued_qr_modules.clone();
+                let bundle_opt = state.issued_bundle.clone();
+                theme::inset(ui, |ui| {
+                    ui.label(theme::subheading(format!("已生成凭证：{label}")));
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some((w, modules)) = qr {
+                            paint_qr_code(ui, 168.0, w, &modules);
                         }
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(theme::muted(
+                                    "手机端可直接扫描左侧二维码；新电脑可直接复制短码，或保存为 .fdesk 文件后拖进新电脑的 FlashDesk 窗口（已包含中转服务器地址）。",
+                                ))
+                                .wrap(),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal_wrapped(|ui| {
+                                if theme::button(ui, "复制 fdesk:// 短码", Kind::Primary).clicked()
+                                {
+                                    ui.ctx().copy_text(token.clone());
+                                    toast(ui, state, Tone::Ok, "已复制绑定短码");
+                                }
+                                if let Some(bundle) = bundle_opt {
+                                    if theme::button(ui, "保存 .fdesk 文件", Kind::Secondary)
+                                        .clicked()
+                                    {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name(format!("{label}.fdesk"))
+                                            .save_file()
+                                        {
+                                            match bundle
+                                                .to_json_pretty()
+                                                .map_err(anyhow::Error::from)
+                                                .and_then(|j| Ok(std::fs::write(&path, j)?))
+                                            {
+                                                Ok(()) => toast(
+                                                    ui,
+                                                    state,
+                                                    Tone::Ok,
+                                                    format!("已保存：{}", path.display()),
+                                                ),
+                                                Err(e) => toast(
+                                                    ui,
+                                                    state,
+                                                    Tone::Danger,
+                                                    format!("保存失败：{e}"),
+                                                ),
+                                            }
+                                        }
+                                    }
+                                }
+                                if theme::button(ui, "收起", Kind::Ghost).clicked() {
+                                    state.issued_compact_token.clear();
+                                    state.issued_bundle = None;
+                                    state.issued_qr_modules = None;
+                                }
+                            });
+                        });
                     });
+                    ui.add_space(4.0);
+                    egui::ScrollArea::vertical()
+                        .id_salt("issued_token_preview")
+                        .max_height(84.0)
+                        .show(ui, |ui| {
+                            if theme::code_box(ui, &token) {
+                                toast(ui, state, Tone::Ok, "已复制绑定短码");
+                            }
+                        });
+                });
             }
         } else {
             ui.add(
                 egui::Label::new(theme::muted(
-                    "这台电脑没有保存个人根私钥：可以新建根密钥作为主设备，或导入主设备签发的 .fdesk 配置包。",
+                    "当前目录未检测到匹配的个人根私钥 (root.key)：可以作为主设备新建根密钥，或导入主电脑签发的 .fdesk 配置包。",
                 ))
                 .wrap(),
             );
-            ui.horizontal(|ui| {
-                if theme::button(ui, "生成个人根密钥", Kind::Primary).clicked() {
-                    conf.init_new_personal_root(default_hostname(), default_relays());
-                    *changed = true;
-                    toast(ui, state, Tone::Ok, "个人根密钥已创建");
+            ui.horizontal_wrapped(|ui| {
+                if theme::button(ui, "生成个人根密钥（主电脑）", Kind::Primary).clicked() {
+                    match conf.init_new_personal_root(cfg_path, default_hostname(), default_relays())
+                    {
+                        Ok(()) => {
+                            *changed = true;
+                            toast(ui, state, Tone::Ok, "个人根密钥已创建并保存至 root.key");
+                        }
+                        Err(e) => toast(ui, state, Tone::Danger, format!("创建失败：{e}")),
+                    }
                 }
                 if theme::button(ui, "导入 .fdesk 文件", Kind::Secondary).clicked() {
                     if let Some(path) = rfd::FileDialog::new()
@@ -200,7 +338,7 @@ fn identity_card(
                     {
                         match std::fs::read_to_string(&path)
                             .map_err(anyhow::Error::from)
-                            .and_then(|s| Ok(DeviceBundle::from_json_str(&s)?))
+                            .and_then(|s| Ok(DeviceBundle::from_any_str(&s)?))
                         {
                             Ok(bundle) => {
                                 conf.import_bundle(bundle);
@@ -215,14 +353,19 @@ fn identity_card(
         }
 
         theme::divider(ui);
-        ui.label(theme::subheading("用导入码替换本机身份"));
+        ui.label(theme::subheading("粘贴绑定短码替换本机身份"));
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 80.0).clamp(200.0, 460.0);
-            theme::text_input(ui, &mut state.import_token_input, w, "粘贴其它主设备生成的 Base64 导入码");
+            let w = (ui.available_width() - 80.0).clamp(140.0, 460.0);
+            theme::text_input(
+                ui,
+                &mut state.import_token_input,
+                w,
+                "粘贴 fdesk://v2/... 短码或旧版导入码",
+            );
             if theme::button(ui, "应用", Kind::Secondary).clicked() {
                 let token = state.import_token_input.trim().to_string();
-                match DeviceBundle::from_b64_token(&token) {
-                    _ if token.is_empty() => toast(ui, state, Tone::Warn, "请先粘贴导入码"),
+                match DeviceBundle::from_any_str(&token) {
+                    _ if token.is_empty() => toast(ui, state, Tone::Warn, "请先粘贴绑定短码"),
                     Ok(b) => {
                         conf.import_bundle(b);
                         state.import_token_input.clear();
@@ -549,19 +692,136 @@ fn unattended_card(
 fn revoke_card(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
+    cfg_path: &Path,
     conf: &mut AppConfig,
+    st: &RelayStatus,
+    relay_cmd_tx: &mpsc::UnboundedSender<RelayCommand>,
     changed: &mut bool,
 ) {
+    let has_root = conf.has_root_key(cfg_path);
     theme::card(ui, |ui| {
         theme::card_header(
             ui,
-            "设备吊销",
-            Some("被吊销的设备无法再连接你的电脑；同步到中转服务器的 relay.toml 后全局生效"),
+            "已签发设备与远程吊销",
+            Some("主电脑签发过的设备会记录在这里；点「吊销」后由根私钥签名并实时踢除，无需再修改服务器"),
             |_| {},
         );
+
+        if st.connected {
+            let sync_note = if let Some((count, _)) = st.last_revocation_sync {
+                format!("已向当前中转同步吊销名单（{count} 台）")
+            } else {
+                "当前中转已连接，吊销变更将实时同步".into()
+            };
+            ui.label(theme::faint(sync_note));
+        }
+
+        let mut toggle_revoke: Option<Uuid> = None;
+        let mut ledger_ids: HashSet<Uuid> = HashSet::new();
+
+        for rec in conf.issued_devices.iter().rev() {
+            ledger_ids.insert(rec.device_id);
+            let online = st.devices.iter().find(|d| d.device_id == rec.device_id);
+            let is_revoked = conf.revoked_device_ids.contains(&rec.device_id);
+            let id_str = rec.device_id.to_string();
+            let title = match online {
+                Some(d) if d.device_name != rec.label => {
+                    format!("{}（备注：{}）", d.device_name, rec.label)
+                }
+                Some(d) => d.device_name.clone(),
+                None => rec.label.clone(),
+            };
+
+            theme::inset(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::status_dot(
+                        ui,
+                        if is_revoked {
+                            c::DANGER
+                        } else if online.is_some() {
+                            c::OK
+                        } else {
+                            c::TEXT_3
+                        },
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if is_revoked {
+                            if theme::small_button(ui, "解除吊销", Kind::Secondary).clicked() {
+                                toggle_revoke = Some(rec.device_id);
+                            }
+                        } else if theme::small_button(ui, "吊销", Kind::Danger).clicked() {
+                            toggle_revoke = Some(rec.device_id);
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(theme::bold(&title).size(13.5)).truncate());
+                            ui.label(theme::mono(format!("{}…", &id_str[..8])))
+                                .on_hover_text(&id_str);
+                            if is_revoked {
+                                theme::chip(ui, "已吊销", c::DANGER, Color32::from_rgb(56, 24, 28));
+                            } else if online.is_some() {
+                                theme::chip(ui, "在线", c::OK, c::ACCENT_SOFT);
+                            }
+                        });
+                    });
+                });
+            });
+        }
+
+        for u in &conf.revoked_device_ids {
+            if !ledger_ids.contains(u) {
+                let id_str = u.to_string();
+                theme::inset(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if theme::small_button(ui, "解除吊销", Kind::Ghost).clicked() {
+                                toggle_revoke = Some(*u);
+                            }
+                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                ui.add(egui::Label::new(theme::mono(&id_str)).truncate());
+                            });
+                        });
+                    });
+                });
+            }
+        }
+
+        if conf.issued_devices.is_empty() && conf.revoked_device_ids.is_empty() {
+            ui.label(theme::faint("暂无已签发的设备记录；在上方为新设备生成凭证后会自动显示在这里。"));
+        }
+
+        if let Some(uid) = toggle_revoke {
+            if let Some(pos) = conf.revoked_device_ids.iter().position(|id| *id == uid) {
+                conf.revoked_device_ids.remove(pos);
+            } else {
+                conf.revoked_device_ids.push(uid);
+            }
+            *changed = true;
+            if has_root {
+                match conf.sign_current_revocations(cfg_path) {
+                    Ok(cmd) => {
+                        let _ = relay_cmd_tx.send(RelayCommand::SyncRevocations(cmd));
+                        toast(
+                            ui,
+                            state,
+                            Tone::Ok,
+                            if st.connected {
+                                "已签名并推送吊销变更到中转服务器"
+                            } else {
+                                "已签名保存吊销名单，连接中转后将自动同步"
+                            },
+                        );
+                    }
+                    Err(e) => toast(ui, state, Tone::Danger, format!("签名吊销名单失败：{e}")),
+                }
+            } else {
+                toast(ui, state, Tone::Warn, "本地已更新（无根私钥，无法向中转远程同步）");
+            }
+        }
+
+        theme::divider(ui);
         ui.horizontal(|ui| {
-            let uuid_w = (ui.available_width() - 130.0).clamp(160.0, 340.0);
-            theme::text_input(ui, &mut state.revoke_uuid_input, uuid_w, "要吊销的设备 UUID");
+            let uuid_w = (ui.available_width() - 130.0).clamp(130.0, 340.0);
+            theme::text_input(ui, &mut state.revoke_uuid_input, uuid_w, "手动输入设备 UUID");
             if theme::button(ui, "加入吊销名单", Kind::Danger).clicked() {
                 match Uuid::parse_str(state.revoke_uuid_input.trim()) {
                     Ok(uid) => {
@@ -570,32 +830,23 @@ fn revoke_card(
                             *changed = true;
                         }
                         state.revoke_uuid_input.clear();
-                        toast(ui, state, Tone::Ok, "已加入吊销名单");
+                        if has_root {
+                            match conf.sign_current_revocations(cfg_path) {
+                                Ok(cmd) => {
+                                    let _ = relay_cmd_tx.send(RelayCommand::SyncRevocations(cmd));
+                                    toast(ui, state, Tone::Ok, "已加入吊销名单并同步到中转服务器");
+                                }
+                                Err(e) => {
+                                    toast(ui, state, Tone::Danger, format!("同步吊销失败：{e}"))
+                                }
+                            }
+                        } else {
+                            toast(ui, state, Tone::Ok, "已加入本地吊销名单");
+                        }
                     }
                     Err(_) => toast(ui, state, Tone::Warn, "UUID 格式不正确"),
                 }
             }
         });
-        if conf.revoked_device_ids.is_empty() {
-            ui.label(theme::faint("吊销名单为空"));
-        } else {
-            let mut remove = None;
-            for (i, u) in conf.revoked_device_ids.iter().enumerate() {
-                theme::inset(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(theme::mono(u.to_string()));
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if theme::small_button(ui, "解除", Kind::Ghost).clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    });
-                });
-            }
-            if let Some(i) = remove {
-                conf.revoked_device_ids.remove(i);
-                *changed = true;
-            }
-        }
     });
 }

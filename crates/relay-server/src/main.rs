@@ -31,6 +31,9 @@ enum Commands {
         /// Optional override base64 root pubkey
         #[arg(long)]
         root_pubkey: Option<String>,
+        /// Optional state directory for persisting remote revocations (revoked.json)
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
     /// Generate a new personal Ed25519 Root CA private key
     InitRoot {
@@ -86,25 +89,33 @@ async fn main() -> Result<()> {
             config,
             listen,
             root_pubkey,
+            state_dir,
         } => {
-            let (listen_addr, root_pub, revoked, timeout_secs) =
+            let (listen_addr, root_pub, revoked, timeout_secs, effective_state_dir) =
                 if let (Some(addr), Some(pk_b64)) = (listen.clone(), root_pubkey.clone()) {
-                    (addr, decode_pubkey_b64(&pk_b64)?, Vec::new(), 15)
+                    (addr, decode_pubkey_b64(&pk_b64)?, Vec::new(), 15, state_dir)
                 } else {
                     let cfg = RelayConfig::load_from_file(&config)?;
                     let addr = listen.unwrap_or(cfg.listen_addr);
                     let pk_b64 = root_pubkey.unwrap_or(cfg.root_pubkey_b64);
                     let pk = decode_pubkey_b64(&pk_b64)?;
-                    (addr, pk, cfg.revoked_device_ids, cfg.pending_timeout_secs)
+                    (
+                        addr,
+                        pk,
+                        cfg.revoked_device_ids,
+                        cfg.pending_timeout_secs,
+                        state_dir.or(cfg.state_dir),
+                    )
                 };
 
             let listener = TcpListener::bind(&listen_addr)
                 .await
                 .with_context(|| format!("failed to bind {listen_addr}"))?;
-            let state = Arc::new(RelayState::new(
+            let state = Arc::new(RelayState::new_with_state_dir(
                 root_pub,
                 revoked,
                 Duration::from_secs(timeout_secs),
+                effective_state_dir,
             ));
             run_server(listener, state).await?;
         }

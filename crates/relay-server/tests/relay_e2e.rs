@@ -818,3 +818,135 @@ async fn relay_multiple_reconnects_and_rapid_bidirectional_control() {
     host_accept_task.abort();
     server_task.abort();
 }
+
+#[tokio::test]
+async fn relay_remote_revocation_kicks_peer_and_persists() {
+    let root = RootKeypair::generate();
+    let other_root = RootKeypair::generate();
+    let admin_id = Uuid::new_v4();
+    let victim_id = Uuid::new_v4();
+    let admin_ident = root.sign_device_cert(admin_id, "AdminPC", 3600);
+    let victim_ident = root.sign_device_cert(victim_id, "VictimPlaceholder", 3600);
+    let root_pub = root.pubkey_bytes();
+
+    let state_dir = std::env::temp_dir().join(format!("flashdesk-relay-test-{}", Uuid::new_v4()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(RelayState::new_with_state_dir(
+        root_pub,
+        vec![],
+        Duration::from_secs(5),
+        Some(state_dir.clone()),
+    ));
+    let server_task = tokio::spawn(run_server(listener, Arc::clone(&state)));
+
+    let mut admin_ws = connect_and_auth_relay(addr, &admin_ident, ConnectionPurpose::Presence)
+        .await
+        .unwrap();
+    let mut victim_ws = connect_and_auth_relay(addr, &victim_ident, ConnectionPurpose::Presence)
+        .await
+        .unwrap();
+
+    // Victim updates its display name dynamically via SetDisplayName.
+    write_frame(
+        &mut victim_ws,
+        &bincode::serialize(&PresenceClientMsg::SetDisplayName("MyActualLaptop".into())).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut saw_renamed_victim = false;
+    for _ in 0..8 {
+        let raw = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut admin_ws))
+            .await
+            .unwrap()
+            .unwrap();
+        if let PresenceServerMsg::DeviceList(list) = bincode::deserialize(&raw).unwrap() {
+            if list
+                .iter()
+                .any(|d| d.device_id == victim_id && d.device_name == "MyActualLaptop")
+            {
+                saw_renamed_victim = true;
+                break;
+            }
+        }
+    }
+    assert!(saw_renamed_victim, "SetDisplayName should update DeviceList");
+
+    // A revocation signed by another root key must be rejected.
+    let bad_cmd = other_root.sign_revocation_list(vec![victim_id]);
+    write_frame(
+        &mut admin_ws,
+        &bincode::serialize(&PresenceClientMsg::SyncRevocations(bad_cmd)).unwrap(),
+    )
+    .await
+    .unwrap();
+    let mut saw_error = false;
+    for _ in 0..5 {
+        let raw = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut admin_ws))
+            .await
+            .unwrap()
+            .unwrap();
+        if let PresenceServerMsg::Error(_) = bincode::deserialize(&raw).unwrap() {
+            saw_error = true;
+            break;
+        }
+    }
+    assert!(saw_error, "wrong-root revocation command must be rejected");
+
+    // Valid root-signed revocation kicks victim immediately and persists to state_dir/revoked.json.
+    let good_cmd = root.sign_revocation_list(vec![victim_id]);
+    write_frame(
+        &mut admin_ws,
+        &bincode::serialize(&PresenceClientMsg::SyncRevocations(good_cmd)).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut saw_synced = false;
+    for _ in 0..5 {
+        let raw = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut admin_ws))
+            .await
+            .unwrap()
+            .unwrap();
+        if let PresenceServerMsg::RevocationsSynced { count, .. } =
+            bincode::deserialize(&raw).unwrap()
+        {
+            assert_eq!(count, 1);
+            saw_synced = true;
+            break;
+        }
+    }
+    assert!(saw_synced, "admin should receive RevocationsSynced");
+
+    // Victim connection must close promptly after kick.
+    let kicked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if read_frame(&mut victim_ws).await.is_err() {
+                return true;
+            }
+        }
+    })
+    .await;
+    assert_eq!(kicked, Ok(true), "revoked online peer must be kicked");
+
+    // Reconnecting as victim is rejected.
+    assert!(
+        connect_and_auth_relay(addr, &victim_ident, ConnectionPurpose::Presence)
+            .await
+            .is_err()
+    );
+
+    server_task.abort();
+
+    // Reloading state from the same state_dir preserves the revocation across relay restarts.
+    let reloaded = RelayState::new_with_state_dir(
+        root_pub,
+        vec![],
+        Duration::from_secs(5),
+        Some(state_dir.clone()),
+    );
+    assert!(reloaded.is_revoked(&victim_id).await);
+
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

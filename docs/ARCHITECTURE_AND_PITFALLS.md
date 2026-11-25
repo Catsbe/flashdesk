@@ -11,7 +11,7 @@
 ### 核心设计决策（已通过 `/grill-me` 对齐并落地）
 1. **技术栈**：Rust 工作区（`protocol` + `relay-server` + `desk-app`）+ 原生 GPU GUI（`eframe` 0.31 / `egui`，使用 **`glow` OpenGL 后端**）+ Windows SDK（`windows` 0.58：`DXGI` / `D3D11` / `GDI` / `Media Foundation` / Win32 Services & SetupAPI）。
 2. **All-in-One 单文件便携客户端（双形态合一）**：
-   - 默认双击即为无黑框便携绿色 GUI 客户端（配置文件优先存放在 `exe` 同目录 `flashdesk.config.json`，若只读则落盘至 `%APPDATA%\FlashDesk\config.json`）。
+   - 默认双击即为无黑框便携绿色 GUI 客户端（配置与根私钥固定存放在 `%USERPROFILE%\.flashdesk\config.json` 与 `root.key`，避免切换 exe 路径丢失身份；系统服务严禁写入空配置）。
    - 支持一键提权（UAC）注册为 Windows `SYSTEM` 后台服务 `FlashDeskService`（Session 0 常驻守护 `--service` + 自动拉起 Session 1 交互桌面代理 `--agent`），支持锁屏（`Winlogon`）、UAC 管理员弹窗穿透及通过 `sas.dll` 发送真实 `Ctrl+Alt+Del`。
    - **服务与桌面 GUI 共存**：若本机系统服务已运行，桌面 GUI 仍可启动作为「主控发起端」，并通过 `PresenceClientMsg::UpdateInfo { accept_incoming: false }` 让中转服优先将入站控屏请求路由给 `accept_incoming: true` 的 SYSTEM 服务实例。
 3. **网络拓扑（多节点纯自建中转 + 局域网直连）**：
@@ -47,24 +47,24 @@ e:\Antigravity项目\自用远程软件\
     ├── protocol\                       # 共享线协议、身份密码学与加密流传输
     │   └── src\
     │       ├── lib.rs                  # 公共导出与 ProtocolError
-    │       ├── auth.rs                 # Ed25519 RootKeypair、DeviceCert、DeviceBundle (.fdesk / Base64 Token)
+    │       ├── auth.rs                 # Ed25519 RootKeypair、DeviceCert、DeviceBundle (fdesk://v2/ / .fdesk)、RevocationCommand
     │       ├── framing.rs              # 4 字节大端长度前缀帧读写（MAX_FRAME_LEN）
     │       ├── noise.rs                # Noise_XX_25519_ChaChaPoly_BLAKE2s + Split Reader/Writer 分片大帧传输
-    │       ├── relay.rs                # RelayHello / RelayAuthRequest / ConnectionPurpose / Presence* 消息定义
+    │       ├── relay.rs                # RelayHello / RelayAuthRequest / ConnectionPurpose / Presence*（含 SyncRevocations / SetDisplayName）
     │       ├── session.rs              # VideoCodec / MonitorInfo / InputEvent / ClipboardData / Vdd* / ControlMsg
     │       └── transfer.rs             # FileEntry / FileMsg（目录浏览、Chunked 断点续传与 SHA-256 校验协议）
     ├── relay-server\                   # 自建无状态感知纯 TCP 中转服务器（flashdesk-relay）
     │   ├── src\
-    │   │   ├── main.rs                 # CLI: serve / init-root / issue-bundle
+    │   │   ├── main.rs                 # CLI: serve (--state-dir) / init-root / issue-bundle
     │   │   ├── config.rs               # RelayConfig (relay.toml 解析)
-    │   │   ├── state.rs                # PeerEntry 路由表（同 ID 共存与逆序最新优先）与 PendingTunnel 配对
-    │   │   └── server.rs               # 认证握手、Presence 心跳（25s 超时）、512KB copy_bidirectional_with_sizes
-    │   └── tests\relay_e2e.rs          # 中转端 4 项端到端集成测试
+    │   │   ├── state.rs                # PeerEntry 路由表、PendingTunnel 配对、远程吊销验签踢人与持久化
+    │   │   └── server.rs               # 认证握手、Presence 心跳（25s 超时）、实时吊销同步、交互/文件分缓冲转发
+    │   └── tests\relay_e2e.rs          # 中转端 6 项端到端集成测试
     └── desk-app\                       # Windows 桌面端 + 被控系统服务（flashdesk.exe）
         ├── build.rs                    # Windows GNU 下静态链接 libstdc++.a / libwinpthread.a / libgcc*.a 组参数
         └── src\
-            ├── main.rs                 # CLI 路由、GUI windows_subsystem、attach_parent_console、panic 弹窗/日志、--self-test
-            ├── config.rs               # AppConfig（节点选择、preferred_file_relay_id、auto_vdd_on_headless、默认 2500kbps）
+            ├── main.rs                 # CLI 路由、GUI 单例互斥、attach_parent_console、panic 弹窗/日志、--self-test
+            ├── config.rs               # AppConfig（固定 %USERPROFILE%\.flashdesk\config.json 与分离 root.key、已签发台账）
             ├── capture\                # 抓屏模块
             │   ├── monitors.rs         # DXGI 适配器与输出枚举 + GetDpiForMonitor (Per-Monitor DPI v2)
             │   └── dxgi.rs             # 三层单屏抓取（DuplicateOutput1 → DuplicateOutput → GdiSingleCapturer）与全景合成
@@ -98,10 +98,10 @@ e:\Antigravity项目\自用远程软件\
                 ├── theme.rs            # 强制暗色主题（不跟随系统浅色）、msyh/msyhbd 字体、色板与卡片/按钮/分段/开关/Toast 组件
                 ├── sysinfo.rs          # 服务/agent/虚拟屏/局域网 IP 状态后台轮询（2 s），UI 线程只读快照
                 ├── screen.rs           # 小屏适配：启动后按显示器工作区（扣除任务栏）缩小/居中窗口，最小尺寸随屏幕下调
-                ├── tray.rs             # Windows 系统托盘：点 X 隐藏到托盘、点击恢复窗口、托盘右键退出
-                ├── app.rs              # 顶部导航 + 居中内容列、配置保存热重载、热切中转节点
-                ├── home.rs             # 首次使用引导、本机身份与状态、在线设备 + IP 直连、中转线路选择
-                ├── settings.rs         # Root CA 签发/.fdesk/导入码/一键复制 relay.toml、节点管理、画面默认值、服务/VDD/吊销（输入框失焦才保存）
+                ├── tray.rs             # Windows 系统托盘与 GUI 单例防多开：点 X 隐入托盘、重开或点击恢复窗口、托盘右键退出
+                ├── app.rs              # 顶部导航、.fdesk 拖拽导入、配置保存自动同步服务、热切中转节点
+                ├── home.rs             # 首次引导（填地址一键建根）、本机身份与服务同步提示、在线设备 + IP 直连
+                ├── settings.rs         # root.key 管理、二维码 & fdesk://v2/ 签发、已签发台账与一键远程吊销、节点/VDD/画质设置
                 └── remote_view.rs      # 远控画面、悬浮工具栏（画质/工具弹出菜单）、HUD、热切控屏中转节点、双栏文件管理+拖拽上传、虚拟屏浮窗、断开对话框
 ```
 
@@ -402,4 +402,4 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 3. **剪贴板大图分片**：剪贴板图片（≤8 MiB PNG）仍是控制通道上的单条消息，传输期间会挡住后续键鼠事件（帧确认已移到视频通道反向，不受影响）。可改为文件通道传输或分片交错发送。
 4. ~~系统托盘（Tray）与后台驻留~~：已于 2026-11 落地（[ui/tray.rs](../crates/desk-app/src/ui/tray.rs)，点 X 隐藏到系统托盘，点击/双击托盘图标恢复窗口，托盘右键「退出 FlashDesk」真正退出）。
 5. **音频转发通道**：`protocol::relay::ChannelKind::AudioReserved` 已在协议层与中转层预留枚举，后续可直接复用独立音频流（WASAPI Loopback + Opus）接入。
-6. **中转端热重载吊销列表**：当前编辑 `/etc/flashdesk/relay.toml` 后需 `systemctl restart flashdesk-relay`，后续可响应 `SIGHUP` 热刷新 `RelayState.revoked_ids`。
+6. ~~中转端热重载吊销列表~~：已于 2026-11 落地（主电脑使用 `root.key` 签名 `RevocationCommand`，通过 `SyncRevocations` 实时下发中转端立即踢除并持久化至 `/var/lib/flashdesk/revoked.json`）。

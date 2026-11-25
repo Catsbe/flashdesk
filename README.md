@@ -11,14 +11,15 @@
 
 ## 特性
 
-- **单文件双形态**：双击即绿色便携 GUI；一键 UAC 注册为 `SYSTEM` 后台服务（Session 0 监督 + 交互会话 agent），
+- **单文件双形态与系统托盘单例**：双击即绿色便携 GUI（关闭 `X` 退到任务栏托盘，托盘右键真正退出；GUI 单例防多开，重复打开直接唤醒已有窗口）。一键 UAC 注册为 `SYSTEM` 后台服务（Session 0 监督 + 交互会话 agent），
   支持**锁屏（Winlogon）/ UAC secure desktop 穿透**与真实 `Ctrl+Alt+Del`（`sas.dll SendSAS`）。
-- **服务与 GUI 共存、按健康度自动接管**：agent 心跳（`agent.status.json`）是唯一让权依据；
-  agent 死亡时桌面 GUI 秒级接管中继被控与 LAN 直连端口，恢复后自动让回（Pitfall #15）。
-- **多节点自建中转 + 局域网直连**：国内低延迟节点控屏、海外大带宽节点分流文件（`PairTunnel` 跨节点对接）；
+- **服务与 GUI 共存、按健康度自动接管**：agent 心跳（`agent.status.json`）+ 服务配置一致性校验决定让权；
+  agent 死亡或服务配置未同步时桌面 GUI 自动接管中继被控，恢复/同步后自动让回（Pitfall #15）。
+- **多节点自建中转 + 局域网直连**：支持多台自建低延迟/大带宽节点分流，默认端口 `9442`（`PairTunnel` 跨节点文件对接）；
   TCP `19444` IP 直连绕过中转，同享端到端加密。
-- **零信任安全模型**：个人 Ed25519 Root CA 签发设备证书（`.fdesk` / Base64 Token）+ 设备吊销名单；
-  中转只验签不落地明文；所有会话 `Noise_XX_25519_ChaChaPoly_BLAKE2s` 端到端加密并跨域绑定握手哈希。
+- **零信任安全模型与极简绑定**：密钥固定存放在 `%USERPROFILE%\.flashdesk\`（`root.key` 与 `config.json` 分离，换用新版 exe 不丢失）；
+  主电脑一键生成紧凑短码（`fdesk://v2/...`）、二维码（供未来手机端扫码）及 `.fdesk` 文件（支持直接拖拽进窗口绑定）；
+  主电脑内置已签发设备台账与根签名**远程吊销**，点击吊销即实时踢除并持久化至 `/var/lib/flashdesk/revoked.json`。
 - **画面链路**：DXGI `DuplicateOutput1 → DuplicateOutput → GDI BitBlt` 三层抓屏降级；
   MF 硬件 HEVC / H.264 低延迟 CBR + OpenH264 软编回退（运行时热切换）；异步 MFT 全超时轮询杜绝死等。
 - **60fps 体验**：首帧预热 + 1s 保活刷新、静止桌面不黑屏、切屏/分辨率变化自动重建编码器。
@@ -56,9 +57,10 @@ cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 
 ### 2. 运行
 
-- 双击 `flashdesk.exe` → 「生成个人根密钥（主设备）」→ 「设置 → 中转节点」填入自建中转地址；
-- 其它电脑导入签发的 `.fdesk` / 导入码即加入白名单互控；
-- 被控端点主页「运行模式」右侧的「安装系统服务」获得锁屏 / UAC 能力；「运行模式」如实显示服务与 agent 健康状态。
+- 主电脑双击 `flashdesk.exe` → 填入中转地址并点击「初始化主电脑（生成根密钥）」，密钥固定保存到 `~/.flashdesk/root.key` 与 `config.json`；
+- 在「设置 → 身份与设备绑定」复制一键部署命令在服务器安装中转，然后点击「生成绑定二维码与密钥」；
+- 其它电脑直接把 `.fdesk` 拖入窗口（或粘贴 `fdesk://v2/...` 短码）即可绑定；
+- 被控端点主页「运行模式」右侧的「安装系统服务」获得锁屏 / UAC 能力；「运行模式」如实显示服务健康与配置同步状态。
 
 ### 3. 部署中转服务器
 
@@ -70,7 +72,7 @@ cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 - 仓库**不包含任何密钥与个人配置**：`*.fdesk`、`config.json`、`flashdesk.config.json`、`relay.toml`、
   `*.key`、`*.log` 与 `/target` 均已 gitignore；设备私钥仅存在于本机配置与 ProgramData 共享配置中。
 - 中转服务器零信任：仅持根公钥与吊销列表，无法解密控制 / 画面 / 文件流量。
-- 丢失设备可在设置或 `relay.toml` 吊销名单中即时踢除。
+- 丢失设备可在主电脑设置页「已签发设备与远程吊销」中一键远程吊销（实时踢除并持久化至 `/var/lib/flashdesk/revoked.json`），或写入 `relay.toml`。
 
 ## 验证状态
 

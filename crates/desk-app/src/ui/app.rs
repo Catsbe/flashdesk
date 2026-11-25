@@ -378,6 +378,69 @@ impl eframe::App for FlashDeskApp {
 
         self.top_bar(ctx);
 
+        // Support dragging a `.fdesk` / `.json` bundle directly onto the main window to bind.
+        let (hovered_files, dropped_files) = ctx.input(|i| {
+            (
+                i.raw.hovered_files.clone(),
+                i.raw.dropped_files.clone(),
+            )
+        });
+        if hovered_files.iter().any(|f| {
+            f.path.as_ref().is_some_and(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(),
+                    Some("fdesk" | "json")
+                )
+            })
+        }) {
+            egui::Area::new(egui::Id::new("fdesk_drop_overlay"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(16, 44, 41, 242))
+                        .stroke(Stroke::new(1.5_f32, c::ACCENT))
+                        .corner_radius(CornerRadius::same(16))
+                        .inner_margin(Margin::symmetric(32, 24))
+                        .show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.label(theme::title("松开鼠标，立即绑定此设备配置包"));
+                                ui.label(theme::muted("配置将自动保存至 ~/.flashdesk/config.json"));
+                            });
+                        });
+                });
+        }
+        if let Some(path) = dropped_files.into_iter().find_map(|f| f.path) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            if matches!(ext.as_deref(), Some("fdesk" | "json")) {
+                let res = std::fs::read_to_string(&path)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|s| Ok(protocol::auth::DeviceBundle::from_any_str(&s)?));
+                match res {
+                    Ok(bundle) => {
+                        self.cfg.lock().unwrap().import_bundle(bundle);
+                        self.save_and_reload_relay();
+                        let t = theme::Toast::new(
+                            ctx,
+                            theme::Tone::Ok,
+                            "已通过拖拽绑定新配置包，正在连接中转…",
+                        );
+                        self.home_state.toast = Some(t.clone());
+                        self.settings_state.toast = Some(t);
+                    }
+                    Err(e) => {
+                        let t = theme::Toast::new(ctx, theme::Tone::Danger, format!("导入失败：{e}"));
+                        self.home_state.toast = Some(t.clone());
+                        self.settings_state.toast = Some(t);
+                    }
+                }
+            }
+        }
+
         let sys = self.sys.lock().unwrap().clone();
         let mut home_action = HomeAction::None;
         let mut settings_changed = false;
@@ -407,6 +470,8 @@ impl eframe::App for FlashDeskApp {
                                     &mut self.settings_state,
                                     &self.cfg_path,
                                     &self.cfg,
+                                    &self.relay_status,
+                                    &self.relay_cmd_tx,
                                     &sys,
                                 );
                             }

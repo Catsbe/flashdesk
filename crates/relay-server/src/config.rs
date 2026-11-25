@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,6 +11,8 @@ pub struct RelayConfig {
     pub revoked_device_ids: Vec<Uuid>,
     #[serde(default = "default_pending_timeout")]
     pub pending_timeout_secs: u64,
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
 }
 
 fn default_pending_timeout() -> u64 {

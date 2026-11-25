@@ -24,6 +24,7 @@ pub struct RelayStatus {
     pub rtt_ms: Option<u32>,
     pub error: Option<String>,
     pub devices: Vec<OnlineDevice>,
+    pub last_revocation_sync: Option<(usize, u64)>,
 }
 
 pub async fn connect_and_auth_relay(
