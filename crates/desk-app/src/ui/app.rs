@@ -73,7 +73,7 @@ impl FlashDeskApp {
         let repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             egui_ctx.request_repaint();
         });
-        let sys = spawn_status_poller(Arc::clone(&repaint));
+        let sys = spawn_status_poller(Arc::clone(&cfg_arc), Arc::clone(&repaint));
 
         let relay_cmd_tx = spawn_relay_manager(
             cfg,
@@ -142,6 +142,13 @@ impl FlashDeskApp {
         let snap = self.cfg.lock().unwrap().clone();
         if let Err(e) = snap.save(&self.cfg_path) {
             tracing::error!("failed to save config: {e}");
+        }
+        // Best-effort silent sync to ProgramData when writable; if UAC blocks it, the GUI
+        // keeps hosting incoming sessions on its own until the user clicks "同步到服务".
+        if std::path::Path::new(crate::service::install::SHARED_CONFIG_PATH).exists()
+            && !snap.service_config_matches_disk()
+        {
+            let _ = crate::service::install::sync_config_file_to_program_data(&self.cfg_path);
         }
         let _ = self.relay_cmd_tx.send(RelayCommand::ReloadConfig(snap));
     }

@@ -1,6 +1,6 @@
 use crate::config::{default_hostname, AppConfig};
 use crate::service::install::{launch_elevated_service_cmd, ServiceState};
-use crate::ui::home::{default_relays, install_service, service_summary};
+use crate::ui::home::{default_relays, install_service, service_summary, sync_service_config};
 use crate::ui::sysinfo::SysStatus;
 use crate::ui::theme::{self, c, Kind, Toast, Tone};
 use crate::vdd::{handle_vdd_request, open_url, MTT_VDD_DOWNLOAD_URL, PARSEC_VDD_DOWNLOAD_URL};
@@ -465,13 +465,16 @@ fn unattended_card(
                     }
                 }
             } else {
-                if theme::small_button(ui, "同步配置到服务", Kind::Secondary)
+                let sync_kind = if sys.service_config_synced {
+                    Kind::Secondary
+                } else {
+                    Kind::Primary
+                };
+                if theme::small_button(ui, "同步配置到服务", sync_kind)
                     .on_hover_text("把当前配置写入 C:\\ProgramData\\FlashDesk\\config.json，3 秒内生效")
                     .clicked()
                 {
-                    let _ = conf.save(cfg_path);
-                    let args = format!("--sync-service-config --config \"{}\"", cfg_path.display());
-                    match launch_elevated_service_cmd(&args) {
+                    match sync_service_config(cfg_path, conf) {
                         Ok(()) => toast(ui, state, Tone::Ok, "已同步最新配置到系统服务（3 秒内生效）"),
                         Err(e) => toast(ui, state, Tone::Danger, format!("同步失败：{e}")),
                     }

@@ -191,6 +191,37 @@ impl AppConfig {
             .find(|n| n.role == RelayNodeRole::FilePreferred)
             .or_else(|| self.active_relay())
     }
+
+    /// Checks whether a running SYSTEM service loaded with `svc` shares this GUI config's
+    /// incoming switch, device identity / root CA, and active relay address.
+    pub fn service_config_matches(&self, svc: &AppConfig) -> bool {
+        if self.allow_incoming != svc.allow_incoming {
+            return false;
+        }
+        let (Some(gb), Some(sb)) = (&self.bundle, &svc.bundle) else {
+            return false;
+        };
+        if gb.root_pubkey != sb.root_pubkey
+            || gb.identity.cert.device_id != sb.identity.cert.device_id
+        {
+            return false;
+        }
+        match (self.active_relay(), svc.active_relay()) {
+            (Some(gr), Some(sr)) => gr.addr.trim() == sr.addr.trim(),
+            _ => false,
+        }
+    }
+
+    /// Reads `C:\ProgramData\FlashDesk\config.json` and checks whether it matches this config.
+    pub fn service_config_matches_disk(&self) -> bool {
+        let Ok(text) = std::fs::read_to_string(crate::service::install::SHARED_CONFIG_PATH) else {
+            return false;
+        };
+        let Ok(svc) = serde_json::from_str::<AppConfig>(&text) else {
+            return false;
+        };
+        self.service_config_matches(&svc)
+    }
 }
 
 pub fn default_hostname() -> String {
@@ -198,4 +229,54 @@ pub fn default_hostname() -> String {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "Windows-PC".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_config() -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.init_new_personal_root(
+            "TestPC",
+            vec![RelayNodeConfig {
+                id: "cn-5m".into(),
+                name: "国内 5M".into(),
+                addr: "203.0.113.10:9442".into(),
+                role: RelayNodeRole::PrimaryControl,
+            }],
+        );
+        cfg
+    }
+
+    #[test]
+    fn service_config_matches_checks_identity_relay_and_incoming() {
+        let base = sample_config();
+        assert!(base.service_config_matches(&base));
+
+        // Different relay port -> out of sync
+        let mut diff_port = base.clone();
+        diff_port.bundle.as_mut().unwrap().relay_nodes[0].addr = "203.0.113.10:19443".into();
+        assert!(!base.service_config_matches(&diff_port));
+
+        // Different device_id -> out of sync
+        let mut diff_dev = base.clone();
+        diff_dev.bundle.as_mut().unwrap().identity.cert.device_id = Uuid::new_v4();
+        assert!(!base.service_config_matches(&diff_dev));
+
+        // Different root_pubkey -> out of sync
+        let mut diff_root = base.clone();
+        diff_root.bundle.as_mut().unwrap().root_pubkey[0] ^= 0xFF;
+        assert!(!base.service_config_matches(&diff_root));
+
+        // Different allow_incoming -> out of sync
+        let mut diff_incoming = base.clone();
+        diff_incoming.allow_incoming = false;
+        assert!(!base.service_config_matches(&diff_incoming));
+
+        // Missing bundle -> out of sync
+        let no_bundle = AppConfig::default();
+        assert!(!base.service_config_matches(&no_bundle));
+        assert!(!no_bundle.service_config_matches(&base));
+    }
 }

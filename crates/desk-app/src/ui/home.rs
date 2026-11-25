@@ -52,7 +52,12 @@ pub(crate) fn default_relays() -> Vec<RelayNodeConfig> {
 /// Status dot colour + one-line description of how this machine runs.
 pub(crate) fn service_summary(sys: &SysStatus) -> (Color32, &'static str) {
     match sys.service {
-        ServiceState::Running if sys.agent_ok => (c::OK, "系统服务运行中 · 支持锁屏 / 登录界面 / UAC"),
+        ServiceState::Running if sys.agent_ok && sys.service_config_synced => {
+            (c::OK, "系统服务运行中 · 支持锁屏 / 登录界面 / UAC")
+        }
+        ServiceState::Running if sys.agent_ok => {
+            (c::WARN, "服务配置未同步 · 桌面端已自动接管被控（锁屏 / UAC 需同步）")
+        }
         ServiceState::Running => (c::WARN, "服务已运行，但桌面代理未启动（锁屏 / UAC 不可用）"),
         ServiceState::Stopped => (c::WARN, "系统服务已安装，但未运行"),
         ServiceState::NotInstalled => (c::TEXT_3, "便携模式 · 未安装系统服务"),
@@ -63,6 +68,15 @@ pub(crate) fn service_summary(sys: &SysStatus) -> (Color32, &'static str) {
 pub(crate) fn install_service(cfg_path: &Path, cfg: &AppConfig) -> Result<(), String> {
     let _ = cfg.save(cfg_path);
     let args = format!("--install-service --config \"{}\"", cfg_path.display());
+    launch_elevated_service_cmd(&args).map_err(|e| e.to_string())
+}
+
+pub(crate) fn sync_service_config(cfg_path: &Path, cfg: &AppConfig) -> Result<(), String> {
+    let _ = cfg.save(cfg_path);
+    if crate::service::install::sync_config_file_to_program_data(cfg_path).is_ok() {
+        return Ok(());
+    }
+    let args = format!("--sync-service-config --config \"{}\"", cfg_path.display());
     launch_elevated_service_cmd(&args).map_err(|e| e.to_string())
 }
 
@@ -250,17 +264,26 @@ fn this_device_card(
                             Err(e) => toast(ui, state, Tone::Danger, format!("服务安装失败：{e}")),
                         }
                     }
-                } else if !sys.agent_ok
-                    && theme::small_button(ui, "重启服务", Kind::Secondary).clicked()
+                } else if !sys.agent_ok {
+                    if theme::small_button(ui, "重启服务", Kind::Secondary).clicked() {
+                        match launch_elevated_service_cmd("--restart-service") {
+                            Ok(()) => toast(
+                                ui,
+                                state,
+                                Tone::Info,
+                                "已请求重启 FlashDeskService；若仍无法启动，请查看 C:\\ProgramData\\FlashDesk\\flashdesk-service.log",
+                            ),
+                            Err(e) => toast(ui, state, Tone::Danger, format!("重启失败：{e}")),
+                        }
+                    }
+                } else if !sys.service_config_synced
+                    && theme::small_button(ui, "同步到服务", Kind::Primary)
+                        .on_hover_text("桌面端已自动接管普通被控；同步后系统服务将支持锁屏与 UAC（3 秒内生效）")
+                        .clicked()
                 {
-                    match launch_elevated_service_cmd("--restart-service") {
-                        Ok(()) => toast(
-                            ui,
-                            state,
-                            Tone::Info,
-                            "已请求重启 FlashDeskService；若仍无法启动，请查看 C:\\ProgramData\\FlashDesk\\flashdesk-service.log",
-                        ),
-                        Err(e) => toast(ui, state, Tone::Danger, format!("重启失败：{e}")),
+                    match sync_service_config(cfg_path, conf) {
+                        Ok(()) => toast(ui, state, Tone::Ok, "已同步最新配置到系统服务（3 秒内生效）"),
+                        Err(e) => toast(ui, state, Tone::Danger, format!("同步失败：{e}")),
                     }
                 }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {

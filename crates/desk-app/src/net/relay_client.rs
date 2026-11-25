@@ -113,11 +113,14 @@ enum PresenceOutcome {
 }
 
 /// The desktop GUI must defer incoming sessions to the SYSTEM agent ONLY while that agent is
-/// actually alive. SCM "service running" alone is not enough: the Session-0 supervisor can be up
-/// while its interactive agent failed to spawn or crashed — deferring in that state leaves nobody
-/// accepting sessions ("connected once, then never again").
-fn host_defers_to_agent(agent_mode: bool) -> bool {
-    !agent_mode && query_service_state() == ServiceState::Running && agent_healthy()
+/// actually alive AND its shared service config matches the GUI's current relay & identity.
+/// Otherwise (agent dead, or user changed port/identity without syncing ProgramData), the GUI
+/// accepts incoming sessions itself so connections don't silently time out.
+fn host_defers_to_agent(agent_mode: bool, cfg: &AppConfig) -> bool {
+    !agent_mode
+        && query_service_state() == ServiceState::Running
+        && agent_healthy()
+        && cfg.service_config_matches_disk()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -156,7 +159,7 @@ async fn run_presence_once(
 
     let (mut reader, mut writer) = stream.into_split();
 
-    let mut effective_accept = cfg.allow_incoming && !host_defers_to_agent(agent_mode);
+    let mut effective_accept = cfg.allow_incoming && !host_defers_to_agent(agent_mode, cfg);
 
     let os_label = if agent_mode {
         "Windows 11 (系统服务)"
@@ -235,14 +238,14 @@ async fn run_presence_once(
                         return PresenceOutcome::Disconnected("心跳发送失败".into());
                     }
                 }
-                // Service/agent health can change while this presence connection stays up
-                // (agent crash, service restart, takeover recovery). Re-evaluate ownership and
-                // push UpdateInfo immediately so the relay routes to whoever can actually host.
-                let new_accept = cfg.allow_incoming && !host_defers_to_agent(agent_mode);
+                // Service/agent health or config sync can change while this presence connection stays
+                // up (agent crash, service restart, config sync, takeover recovery). Re-evaluate
+                // ownership and push UpdateInfo immediately so the relay routes to whoever can host.
+                let new_accept = cfg.allow_incoming && !host_defers_to_agent(agent_mode, cfg);
                 if new_accept != effective_accept {
                     effective_accept = new_accept;
                     tracing::info!(
-                        "accept_incoming -> {new_accept} (service/agent health changed)"
+                        "accept_incoming -> {new_accept} (service/agent health or config sync changed)"
                     );
                     let update = PresenceClientMsg::UpdateInfo {
                         monitor_count,
