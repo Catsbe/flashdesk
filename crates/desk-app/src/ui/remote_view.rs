@@ -67,7 +67,7 @@ impl RemoteViewState {
             scale_mode: ScaleMode::Fit,
             fullscreen: false,
             toolbar_collapsed: false,
-            show_stats: true,
+            show_stats: false,
             bitrate_mbps: (initial_bitrate_kbps as f32 / 1000.0).clamp(1.0, 50.0),
             target_fps: initial_fps,
             res_cap_h: initial_res_cap_h,
@@ -306,7 +306,7 @@ pub fn render_remote_view(
                         theme::label_max_width(
                             ui,
                             theme::bold(&session.peer_name).size(14.0),
-                            150.0,
+                            130.0,
                         )
                         .on_hover_text(&session.via_label);
                         ui.add_space(4.0);
@@ -357,6 +357,12 @@ pub fn render_remote_view(
                             if theme::pill(ui, "文件传输", state.show_file_panel, false).clicked() {
                                 state.toggle_file_panel(session);
                             }
+                            if theme::pill(ui, "详情", state.show_stats, true)
+                                .on_hover_text("显示或隐藏帧率、延迟、码率与编解码详情")
+                                .clicked()
+                            {
+                                state.show_stats = !state.show_stats;
+                            }
                             toolbar_sep(ui);
                             let fs_label = if state.fullscreen { "退出全屏" } else { "全屏" };
                             if theme::pill(ui, fs_label, false, false)
@@ -377,15 +383,34 @@ pub fn render_remote_view(
                 });
         });
 
-    // Live stats (top right, below the toolbar). On small windows only the headline numbers,
-    // so the panel doesn't cover a big part of the remote screen.
-    if state.show_stats {
+    // Live stats (centered directly under the top toolbar when expanded; hidden by default).
+    if state.show_stats && !state.toolbar_collapsed {
         let screen = ctx.screen_rect();
-        let compact = screen.width() < 800.0 || screen.height() < 500.0;
+        let compact = screen.width() < 560.0 || screen.height() < 420.0;
         egui::Area::new(egui::Id::new("remote_hud"))
-            .anchor(Align2::RIGHT_TOP, vec2(-12.0, 62.0))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, 56.0))
+            .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| hud_panel(ui, &hud, compact));
+    } else if let Some(notice) = &hud.status_notice {
+        let y_offset = if state.toolbar_collapsed { 52.0 } else { 56.0 };
+        egui::Area::new(egui::Id::new("remote_hud_notice"))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, y_offset))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(13, 16, 22, 220))
+                    .stroke(Stroke::new(1.0_f32, c::WARN.gamma_multiply(0.5)))
+                    .corner_radius(CornerRadius::same(8))
+                    .inner_margin(Margin::symmetric(12, 6))
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(notice).size(12.5).color(c::WARN))
+                                .extend(),
+                        );
+                    });
+            });
     }
 
     // M2 Dual-Pane File Transfer Manager Window
@@ -646,10 +671,6 @@ fn tools_menu(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSe
             if theme::toggle(ui, &mut state.clipboard_enabled).changed() {
                 session.send(ViewerCommand::SetClipboardEnabled(state.clipboard_enabled));
             }
-            ui.end_row();
-
-            ui.label(menu_label("性能统计"));
-            theme::toggle(ui, &mut state.show_stats);
             ui.end_row();
 
             ui.label(menu_label("画面缩放"));
