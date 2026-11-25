@@ -6,3 +6,5 @@ config.json
 flashdesk.config.json
 relay.toml
 *.log
+/deploy/flashdesk-relay-linux-x86_64
+/crates/desk-app/examples/
