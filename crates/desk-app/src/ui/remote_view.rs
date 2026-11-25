@@ -109,6 +109,13 @@ impl RemoteViewState {
             self.file_panel_initialized = true;
         }
     }
+
+    pub fn exit_fullscreen(&mut self, ctx: &egui::Context) {
+        if self.fullscreen {
+            self.fullscreen = false;
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        }
+    }
 }
 
 pub fn render_remote_view(

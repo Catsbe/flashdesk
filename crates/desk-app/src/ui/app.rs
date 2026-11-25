@@ -14,6 +14,7 @@ use crate::ui::screen;
 use crate::ui::settings::{render_settings, SettingsState};
 use crate::ui::sysinfo::{spawn_status_poller, SharedSysStatus};
 use crate::ui::theme::{self, c};
+use crate::ui::tray::{self, TrayHandle};
 use eframe::egui::{
     self, Align, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, StrokeKind,
 };
@@ -52,6 +53,8 @@ pub struct FlashDeskApp {
     active_session: Option<(ViewerSessionHandle, RemoteViewState)>,
     /// The window has been checked against the monitor's work area (see `ui::screen`).
     window_fitted: bool,
+    tray: TrayHandle,
+    main_hwnd_resolved: bool,
 }
 
 impl FlashDeskApp {
@@ -84,6 +87,9 @@ impl FlashDeskApp {
         // re-binds automatically when the agent dies, so LAN direct never silently disappears.
         spawn_direct_listener(Arc::clone(&cfg_arc), caps.clone(), false);
 
+        let main_hwnd = tray::find_main_window_hwnd();
+        let tray = TrayHandle::spawn(main_hwnd, cc.egui_ctx.clone());
+
         Self {
             cfg_path,
             cfg: cfg_arc,
@@ -97,6 +103,8 @@ impl FlashDeskApp {
             settings_state: SettingsState::default(),
             active_session: None,
             window_fitted: false,
+            tray,
+            main_hwnd_resolved: main_hwnd != 0,
         }
     }
 
@@ -307,6 +315,29 @@ fn content_column(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 
 impl eframe::App for FlashDeskApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.main_hwnd_resolved {
+            let h = tray::find_main_window_hwnd();
+            if h != 0 {
+                self.tray.set_main_hwnd(h);
+                self.main_hwnd_resolved = true;
+            }
+        }
+        if self.tray.quit_requested() {
+            if let Some((session, _)) = self.active_session.take() {
+                session.send(ViewerCommand::Disconnect);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_active() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if let Some((_, view_state)) = &mut self.active_session {
+                view_state.exit_fullscreen(ctx);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        }
+
         self.fit_window_to_screen(ctx);
 
         if let Some((session, view_state)) = &mut self.active_session {
@@ -386,5 +417,12 @@ impl eframe::App for FlashDeskApp {
             HomeAction::ConnectDirect(addr) => self.start_session(ctx, ConnectTarget::Direct(addr)),
             HomeAction::None => {}
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some((session, _)) = self.active_session.take() {
+            session.send(ViewerCommand::Disconnect);
+        }
+        self.tray.shutdown();
     }
 }

@@ -98,6 +98,7 @@ e:\Antigravity项目\自用远程软件\
                 ├── theme.rs            # 强制暗色主题（不跟随系统浅色）、msyh/msyhbd 字体、色板与卡片/按钮/分段/开关/Toast 组件
                 ├── sysinfo.rs          # 服务/agent/虚拟屏/局域网 IP 状态后台轮询（2 s），UI 线程只读快照
                 ├── screen.rs           # 小屏适配：启动后按显示器工作区（扣除任务栏）缩小/居中窗口，最小尺寸随屏幕下调
+                ├── tray.rs             # Windows 系统托盘：点 X 隐藏到托盘、点击恢复窗口、托盘右键退出
                 ├── app.rs              # 顶部导航 + 居中内容列、配置保存热重载、热切中转节点
                 ├── home.rs             # 首次使用引导、本机身份与状态、在线设备 + IP 直连、中转线路选择
                 ├── settings.rs         # Root CA 签发/.fdesk/导入码/一键复制 relay.toml、节点管理、画面默认值、服务/VDD/吊销（输入框失焦才保存）
@@ -399,6 +400,6 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 1. ~~动态码率自适应（ABR）~~：已于 2026-11 落地（坑 #16，`net/flow.rs`）。可继续：把 ABR 目标与分辨率联动（持续低于 ~2 Mbps 时自动降到 1080p/720p）。
 2. **D3D11 GPU 零拷贝 `BGRA -> NV12` 与硬编直通**：当前 DXGI 拷贝到 CPU staging 后运行 `bgra_to_nv12`（2026-11 起已多线程分带并行），若进一步把 `ID3D11VideoProcessor` 或 Compute Shader + D3D11 纹理直喂 MF 硬件编码器，可再降 2K/4K 下的 CPU 占用；主控端同理可用 NV12 纹理 + 着色器转 RGB。
 3. **剪贴板大图分片**：剪贴板图片（≤8 MiB PNG）仍是控制通道上的单条消息，传输期间会挡住后续键鼠事件（帧确认已移到视频通道反向，不受影响）。可改为文件通道传输或分片交错发送。
-4. **系统托盘（Tray）与后台驻留**：无安装服务纯绿色模式下支持最小化到右下角系统托盘。
+4. ~~系统托盘（Tray）与后台驻留~~：已于 2026-11 落地（[ui/tray.rs](../crates/desk-app/src/ui/tray.rs)，点 X 隐藏到系统托盘，点击/双击托盘图标恢复窗口，托盘右键「退出 FlashDesk」真正退出）。
 5. **音频转发通道**：`protocol::relay::ChannelKind::AudioReserved` 已在协议层与中转层预留枚举，后续可直接复用独立音频流（WASAPI Loopback + Opus）接入。
 6. **中转端热重载吊销列表**：当前编辑 `/etc/flashdesk/relay.toml` 后需 `systemctl restart flashdesk-relay`，后续可响应 `SIGHUP` 热刷新 `RelayState.revoked_ids`。

@@ -386,6 +386,11 @@ fn main() -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size(ui::screen::DEFAULT_INNER)
             .with_min_inner_size(ui::screen::MIN_INNER)
+            .with_icon(eframe::egui::IconData {
+                rgba: ui::tray::build_tray_icon_rgba(),
+                width: 32,
+                height: 32,
+            })
             .with_title("FlashDesk — 自建高速远程桌面"),
         centered: true,
         ..Default::default()
