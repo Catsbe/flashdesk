@@ -598,14 +598,17 @@ impl eframe::App for FlashDeskApp {
                 self.main_hwnd_resolved = true;
             }
         }
-        if self.tray.quit_requested() {
+        if self.tray.quit_requested() || self.tray.system_shutdown() {
             if let Some((session, _)) = self.active_session.take() {
                 session.send(ViewerCommand::Disconnect);
             }
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             return;
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.tray.is_active() {
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.tray.is_active()
+            && !self.tray.system_shutdown()
+        {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             if let Some((_, view_state)) = &mut self.active_session {
                 view_state.exit_fullscreen(ctx);
@@ -795,9 +798,12 @@ impl eframe::App for FlashDeskApp {
         if let Some((session, _)) = self.active_session.take() {
             session.send(ViewerCommand::Disconnect);
         }
-        self.tray.shutdown();
-        if !self.restarting_for_update {
-            crate::service::install::stop_service_for_app_exit();
+        let shutting_down = self.tray.system_shutdown();
+        if !shutting_down {
+            self.tray.shutdown();
+            if !self.restarting_for_update {
+                crate::service::install::stop_service_for_app_exit();
+            }
         }
     }
 }

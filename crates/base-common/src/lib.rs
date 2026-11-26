@@ -29,6 +29,17 @@ pub const WATCHDOG_HEALTH_WINDOW_SECS: u64 = 15;
 pub const IDLE_WAIT_BEFORE_SWITCH_SECS: u64 = 10;
 pub const AGENT_HEARTBEAT_TIMEOUT_SECS: u64 = 12;
 
+/// Distinct exit code returned by `--agent` when Windows announces `WM_ENDSESSION` so the
+/// Session-0 supervisor knows the session is logging off / shutting down rather than crashing.
+pub const AGENT_EXIT_CODE_SESSION_ENDING: u32 = 0x4644_5348;
+
+pub const WTS_EVENT_CONSOLE_CONNECT: u32 = 1;
+pub const WTS_EVENT_CONSOLE_DISCONNECT: u32 = 2;
+pub const WTS_EVENT_SESSION_LOGON: u32 = 5;
+pub const WTS_EVENT_SESSION_LOGOFF: u32 = 6;
+pub const WTS_EVENT_SESSION_LOCK: u32 = 7;
+pub const WTS_EVENT_SESSION_UNLOCK: u32 = 8;
+
 pub const CORE_EXE_NAME: &str = "flashdesk-core.exe";
 pub const LAUNCHER_EXE_NAME: &str = "FlashDesk.exe";
 pub const SVC_EXE_NAME: &str = "flashdesk-svc.exe";
@@ -732,6 +743,59 @@ pub fn prune_old_versions(versions_dir: &Path, state: &InstallState) -> std::io:
     Ok(removed)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleSessionAction {
+    RunAgent(u32),
+    PauseAndTerminate,
+    WaitForSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionChangeEffect {
+    SuppressSession(u32),
+    ClearSuppression,
+    NoChange,
+}
+
+/// Maps a `SERVICE_CONTROL_SESSIONCHANGE` event into how the Session-0 service supervisor should
+/// adjust console agent suppression. Session lock (`WTS_SESSION_LOCK`) intentionally keeps
+/// `--agent` running so remote unlock / lockscreen control continues to work.
+pub fn classify_session_change(event_type: u32, session_id: u32) -> SessionChangeEffect {
+    match event_type {
+        WTS_EVENT_SESSION_LOGOFF | WTS_EVENT_CONSOLE_DISCONNECT => {
+            if session_id != u32::MAX {
+                SessionChangeEffect::SuppressSession(session_id)
+            } else {
+                SessionChangeEffect::NoChange
+            }
+        }
+        WTS_EVENT_CONSOLE_CONNECT | WTS_EVENT_SESSION_LOGON | WTS_EVENT_SESSION_UNLOCK => {
+            SessionChangeEffect::ClearSuppression
+        }
+        _ => SessionChangeEffect::NoChange,
+    }
+}
+
+/// Pure decision function for the Session-0 supervisor loop: decides whether `--agent` should
+/// run in `active_session`, pause & terminate during suspend/logoff/Fast Startup, or wait.
+pub fn decide_console_agent_action(
+    active_session: u32,
+    system_suspending: bool,
+    suppressed_session: u32,
+    session_connectable: bool,
+) -> ConsoleSessionAction {
+    if system_suspending {
+        return ConsoleSessionAction::PauseAndTerminate;
+    }
+    if active_session == u32::MAX {
+        return ConsoleSessionAction::WaitForSession;
+    }
+    if active_session == suppressed_session || !session_connectable {
+        return ConsoleSessionAction::PauseAndTerminate;
+    }
+    ConsoleSessionAction::RunAgent(active_session)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,5 +1061,87 @@ mod tests {
         assert_eq!(rgba[3], 0);
         let center_alpha = rgba[(16 * 32 + 16) * 4 + 3];
         assert_eq!(center_alpha, 255);
+    }
+
+    #[test]
+    fn session_change_and_power_lifecycle_decisions() {
+        // Normal active console session starts/keeps the agent running.
+        assert_eq!(
+            decide_console_agent_action(1, false, u32::MAX, true),
+            ConsoleSessionAction::RunAgent(1)
+        );
+
+        // Locking the screen must NOT suppress or tear down the agent (lockscreen remote control).
+        assert_eq!(
+            classify_session_change(WTS_EVENT_SESSION_LOCK, 1),
+            SessionChangeEffect::NoChange
+        );
+        assert_eq!(
+            decide_console_agent_action(1, false, u32::MAX, true),
+            ConsoleSessionAction::RunAgent(1)
+        );
+
+        // Logging off or disconnecting the active console session suppresses that session.
+        assert_eq!(
+            classify_session_change(WTS_EVENT_SESSION_LOGOFF, 1),
+            SessionChangeEffect::SuppressSession(1)
+        );
+        assert_eq!(
+            classify_session_change(WTS_EVENT_CONSOLE_DISCONNECT, 1),
+            SessionChangeEffect::SuppressSession(1)
+        );
+        assert_eq!(
+            decide_console_agent_action(1, false, 1, true),
+            ConsoleSessionAction::PauseAndTerminate
+        );
+
+        // Logging off a different non-console session does not block active console session 1.
+        assert_eq!(
+            classify_session_change(WTS_EVENT_SESSION_LOGOFF, 2),
+            SessionChangeEffect::SuppressSession(2)
+        );
+        assert_eq!(
+            decide_console_agent_action(1, false, 2, true),
+            ConsoleSessionAction::RunAgent(1)
+        );
+
+        // Reconnecting / logging back in / unlocking clears suppression.
+        assert_eq!(
+            classify_session_change(WTS_EVENT_CONSOLE_CONNECT, 1),
+            SessionChangeEffect::ClearSuppression
+        );
+        assert_eq!(
+            classify_session_change(WTS_EVENT_SESSION_LOGON, 1),
+            SessionChangeEffect::ClearSuppression
+        );
+        assert_eq!(
+            classify_session_change(WTS_EVENT_SESSION_UNLOCK, 1),
+            SessionChangeEffect::ClearSuppression
+        );
+        assert_eq!(
+            decide_console_agent_action(1, false, u32::MAX, true),
+            ConsoleSessionAction::RunAgent(1)
+        );
+
+        // Suspend / Fast Startup (Hybrid Shutdown) always pauses even if session 1 is still active.
+        assert_eq!(
+            decide_console_agent_action(1, true, u32::MAX, true),
+            ConsoleSessionAction::PauseAndTerminate
+        );
+        // Resuming from suspend allows the agent to run again.
+        assert_eq!(
+            decide_console_agent_action(1, false, u32::MAX, true),
+            ConsoleSessionAction::RunAgent(1)
+        );
+
+        // Non-connectable session (e.g. WTSDown during teardown) pauses; u32::MAX waits.
+        assert_eq!(
+            decide_console_agent_action(1, false, u32::MAX, false),
+            ConsoleSessionAction::PauseAndTerminate
+        );
+        assert_eq!(
+            decide_console_agent_action(u32::MAX, false, u32::MAX, false),
+            ConsoleSessionAction::WaitForSession
+        );
     }
 }

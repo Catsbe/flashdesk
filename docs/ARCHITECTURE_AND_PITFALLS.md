@@ -1,6 +1,6 @@
 # FlashDesk 架构设计、开发约束与踩坑交接文档
 
-> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#19）。
+> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#20）。
 > **安装程序与自动更新架构详述见：[AUTO_UPDATE_AND_INSTALLER.md](AUTO_UPDATE_AND_INSTALLER.md)。**
 
 ---
@@ -211,7 +211,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 
 ---
 
-## 四、完整踩坑记录与避坑红线（Pitfalls #1–#19）
+## 四、完整踩坑记录与避坑红线（Pitfalls #1–#20）
 
 ### A. 工具链、编译与打包类
 
@@ -409,6 +409,23 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
     sudo nft insert rule inet filter input handle "$H" tcp dport <端口> ct state new accept
     ```
   - **持久化**：在 `/etc/nftables.conf` 对应端口集合中补充 `<端口>` 后执行 `sudo nft -c -f /etc/nftables.conf` 做语法干跑校验；**若宿主机同时跑 Docker，切忌直接 `flush ruleset` 或整表重启 `nftables`**，以免误清 Docker 管理的 `ip filter` / `ip nat` 转发规则。
+
+#### 坑 #20：Windows 关机 / 混合快速启动卡顿极慢——系统服务在注销阶段抢拉 `--agent` 与托盘 GUI 不响应 `WM_ENDSESSION`（2026-11-26 修复）
+- **现象**：笔记本运行 FlashDesk 期间点击关机，Windows 长时间卡在关机转圈画面；关机前先从右下角托盘「退出 FlashDesk」（会停止系统服务）再关机，立刻秒关。
+- **根因（四层叠加，尤其在笔记本默认「快速启动 / 混合关机」下放大）**：
+  1. **Session 1 注销阶段服务与系统抢进程**：Windows 关机先注销用户桌面会话（Session 1），再向 Session 0 服务发 `SERVICE_CONTROL_SHUTDOWN`；笔记本默认的**混合快速启动**更是在注销 Session 1 后直接休眠内核，**根本不会发 `SERVICE_CONTROL_SHUTDOWN`**。但 [flashdesk_svc.rs](../crates/base-runtime/src/bin/flashdesk_svc.rs) 与 [win_service.rs](../crates/desk-app/src/service/win_service.rs) 虽注册了 `SERVICE_ACCEPT_SESSIONCHANGE`，却在 `service_ctrl_handler` 中仅递增未读的 `SESSION_GEN`、忽略了 `WTS_SESSION_LOGOFF` / `WTS_CONSOLE_DISCONNECT`，且未订阅 `SERVICE_ACCEPT_POWEREVENT`（`PBT_APMSUSPEND`）和 `SERVICE_ACCEPT_PRESHUTDOWN`。当系统杀掉 Session 1 中的 `--agent` 时，服务见 `WTSGetActiveConsoleSessionId()` 仍返回 `1`，0–500 ms 内立刻重拉新 `--agent` 并触发 `probe_capabilities()`（COM / Media Foundation / 双显卡硬件探测），与桌面/DWM 退出死磕。
+  2. **`--agent` 缺少系统关机监听窗口**：无头代理（`windows_subsystem = "windows"`）没有任何顶层窗口处理 `WM_QUERYENDSESSION` / `WM_ENDSESSION`，注销时易残留等待或退出后未告知监督进程属于系统关机退出。
+  3. **GUI / 托盘不响应 `WM_ENDSESSION` 且退出钩子阻塞**：`winit 0.30` 与 [tray.rs](../crates/desk-app/src/ui/tray.rs) 的隐藏托盘窗口均把 `WM_QUERYENDSESSION` / `WM_ENDSESSION` 交给了 `DefWindowProcW`，关机时主窗口无法主动退出；同时 [app.rs](../crates/desk-app/src/ui/app.rs) 的 `on_exit()` 在检测到托盘退出以外路径时仍串行执行 `tray.shutdown()`（`Shell_NotifyIconW` 在 Explorer 退出期间易阻塞）以及 `stop_service_for_app_exit()`（同步最多等 5 秒、旧安装甚至弹 UAC，还会把 `FlashDeskService` 停掉导致下次快速启动开机后服务未运行）。
+  4. **服务睡眠与清理超时**：`sleep_interruptible` 依赖 100 ms 轮询，收到停服/电源信号不能瞬间唤醒；`terminate_child` 无条件等待最长 3000 ms 且 `dwCheckPoint` 恒为 0。
+- **方案（已落地）**：
+  - **纯状态机抽取与单测**（[crates/base-common/src/lib.rs](../crates/base-common/src/lib.rs)）：新增 `classify_session_change()`、`decide_console_agent_action()` 及 `AGENT_EXIT_CODE_SESSION_ENDING`。仅对 `WTS_SESSION_LOGOFF` / `WTS_CONSOLE_DISCONNECT` 抑制对应会话，**刻意保留 `WTS_SESSION_LOCK` 放行**以保证锁屏远控；`WTS_CONSOLE_CONNECT` / `WTS_SESSION_LOGON` / `WTS_SESSION_UNLOCK` 解除抑制。
+  - **服务侧（`flashdesk_svc.rs` & `win_service.rs`）**：订阅 `SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_POWEREVENT`；用 `CreateEventW` / `SetEvent` 替代 100 ms 轮询实现控制通知秒级唤醒；拉起前再查 `WTSQuerySessionInformationW(WTSConnectState)`，收到关机、预关机、`PBT_APMSUSPEND`、会话注销或 `AGENT_EXIT_CODE_SESSION_ENDING` 退出码时立即终止并暂停拉起 `--agent`，直到系统恢复（`PBT_APMRESUMEAUTOMATIC` / `PBT_APMRESUMESUSPEND`）或新会话连接后再恢复；缩短关机子进程等待至 500–1000 ms 并上报 `dwCheckPoint`。
+  - **`--agent` 关机监听**（[main.rs](../crates/desk-app/src/main.rs) `spawn_agent_shutdown_watcher`）：启动独立线程创建隐藏顶层工具窗口（`WS_EX_TOOLWINDOW | WS_POPUP`，非 `HWND_MESSAGE` 才能收到广播）监听 `WM_QUERYENDSESSION`（秒回 `1`）与 `WM_ENDSESSION`（清理 `agent.status.json` 后以 `AGENT_EXIT_CODE_SESSION_ENDING` 退出，避免触发候选版本回滚计数）。
+  - **GUI / 托盘快速让路**（[tray.rs](../crates/desk-app/src/ui/tray.rs) & [app.rs](../crates/desk-app/src/ui/app.rs)）：托盘窗口收到 `WM_QUERYENDSESSION` 秒回 `1`，收到 `WM_ENDSESSION` 标记 `system_shutdown` 后立即 `std::process::exit(0)`，不再阻塞于 `winit` / `Shell_NotifyIconW`；`app.rs` 同步跳过 `CancelClose`、`tray.shutdown()` 与 `stop_service_for_app_exit()`（托盘菜单手动点「退出 FlashDesk」仍照常自动停服务）。
+- **红线**：
+  - 严禁在 `SERVICE_CONTROL_SESSIONCHANGE` 中忽略 `WTS_SESSION_LOGOFF` / `WTS_CONSOLE_DISCONNECT` 或在 `PBT_APMSUSPEND` 期间继续拉起 `--agent`；
+  - 严禁在 `WM_ENDSESSION` 系统关机路径调用 `stop_service_for_app_exit()`；
+  - 本次修改涉及冻结基座 `flashdesk-svc.exe`，更新代码后必须在已安装机器上运行新版 `FlashDesk-Setup.exe` 覆盖基座才能生效。
 
 ---
 

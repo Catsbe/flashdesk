@@ -470,7 +470,86 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn spawn_agent_shutdown_watcher() {
+    let _ = std::thread::Builder::new()
+        .name("flashdesk-agent-shutdown".into())
+        .spawn(run_agent_shutdown_window);
+}
+
+fn run_agent_shutdown_window() {
+    use windows::core::w;
+    use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
+        TranslateMessage, MSG, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW, WS_EX_TOOLWINDOW,
+        WS_POPUP,
+    };
+
+    unsafe extern "system" fn agent_shutdown_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_QUERYENDSESSION => LRESULT(1),
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    tracing::info!(
+                        "agent received WM_ENDSESSION (lparam={}); exiting cleanly",
+                        lparam.0
+                    );
+                    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+                    std::process::exit(base_common::AGENT_EXIT_CODE_SESSION_ENDING as i32);
+                }
+                LRESULT(0)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe {
+        let hinstance = GetModuleHandleW(None).unwrap_or_default();
+        let class_name = w!("FlashDeskAgentShutdownClass");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(agent_shutdown_wnd_proc),
+            hInstance: hinstance.into(),
+            lpszClassName: class_name,
+            ..Default::default()
+        };
+        let _ = RegisterClassW(&wc);
+
+        // Must be a top-level window (not HWND_MESSAGE) so Windows broadcasts WM_QUERYENDSESSION /
+        // WM_ENDSESSION during logoff, Fast Startup, and shutdown.
+        let Ok(_hwnd) = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class_name,
+            w!("FlashDeskAgent"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            hinstance,
+            None,
+        ) else {
+            return;
+        };
+
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 fn run_headless_agent(cfg_path: PathBuf) -> Result<()> {
+    spawn_agent_shutdown_watcher();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

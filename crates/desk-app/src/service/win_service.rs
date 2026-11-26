@@ -1,9 +1,13 @@
 use crate::service::install::SERVICE_NAME;
 use anyhow::{Context, Result};
+use base_common::{
+    classify_session_change, decide_console_agent_action, ConsoleSessionAction,
+    SessionChangeEffect, AGENT_EXIT_CODE_SESSION_ENDING,
+};
 use std::ffi::{c_void, OsStr};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
@@ -16,32 +20,51 @@ use windows::Win32::Security::{
     TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows::Win32::System::RemoteDesktop::{
-    ProcessIdToSessionId, WTSGetActiveConsoleSessionId,
+    ProcessIdToSessionId, WTSActive, WTSConnectState, WTSConnected, WTSFreeMemory,
+    WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSSESSION_NOTIFICATION,
+    WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE,
 };
 use windows::Win32::System::Services::{
     RegisterServiceCtrlHandlerExW, SetServiceStatus, StartServiceCtrlDispatcherW,
-    SERVICE_ACCEPT_SESSIONCHANGE, SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP,
-    SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN, SERVICE_CONTROL_STOP,
-    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_HANDLE,
-    SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_ACCEPT_POWEREVENT, SERVICE_ACCEPT_PRESHUTDOWN, SERVICE_ACCEPT_SESSIONCHANGE,
+    SERVICE_ACCEPT_SHUTDOWN, SERVICE_ACCEPT_STOP, SERVICE_CONTROL_POWEREVENT,
+    SERVICE_CONTROL_PRESHUTDOWN, SERVICE_CONTROL_SESSIONCHANGE, SERVICE_CONTROL_SHUTDOWN,
+    SERVICE_CONTROL_STOP, SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS,
+    SERVICE_STATUS_HANDLE, SERVICE_STOPPED, SERVICE_STOP_PENDING, SERVICE_TABLE_ENTRYW,
+    SERVICE_WIN32_OWN_PROCESS,
 };
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-    TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    CreateEventW, CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcess,
+    OpenProcessToken, SetEvent, TerminateProcess, WaitForSingleObject, CREATE_NO_WINDOW,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    STARTUPINFOW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND,
 };
 
 static CONFIG_PATH_CELL: OnceLock<PathBuf> = OnceLock::new();
-static STATUS_HANDLE: AtomicU32 = AtomicU32::new(0);
 static STOP_FLAG: AtomicBool = AtomicBool::new(false);
+static SYSTEM_SUSPENDING: AtomicBool = AtomicBool::new(false);
+static SUPPRESSED_SESSION_ID: AtomicU32 = AtomicU32::new(u32::MAX);
 static SESSION_GEN: AtomicU32 = AtomicU32::new(0);
+static WAKE_EVENT_PTR: AtomicIsize = AtomicIsize::new(0);
 static STATUS_HANDLE_PTR: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+fn signal_wake_event() {
+    let raw = WAKE_EVENT_PTR.load(Ordering::Acquire);
+    if raw != 0 {
+        unsafe {
+            let _ = SetEvent(HANDLE(raw as *mut c_void));
+        }
+    }
+}
 
 fn to_wide_null(s: &OsStr) -> Vec<u16> {
     s.encode_wide().chain(std::iter::once(0)).collect()
 }
 
-fn report_status(state: u32, controls_accepted: u32, wait_hint: u32) {
+fn report_status(state: u32, controls_accepted: u32, check_point: u32, wait_hint: u32) {
     let Some(raw) = *STATUS_HANDLE_PTR.lock().unwrap() else {
         return;
     };
@@ -52,7 +75,7 @@ fn report_status(state: u32, controls_accepted: u32, wait_hint: u32) {
         dwControlsAccepted: controls_accepted,
         dwWin32ExitCode: 0,
         dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 0,
+        dwCheckPoint: check_point,
         dwWaitHint: wait_hint,
     };
     unsafe {
@@ -62,18 +85,51 @@ fn report_status(state: u32, controls_accepted: u32, wait_hint: u32) {
 
 unsafe extern "system" fn service_ctrl_handler(
     control: u32,
-    _event_type: u32,
-    _event_data: *mut c_void,
+    event_type: u32,
+    event_data: *mut c_void,
     _context: *mut c_void,
 ) -> u32 {
     match control {
-        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN => {
-            report_status(SERVICE_STOP_PENDING.0, 0, 5000);
+        SERVICE_CONTROL_STOP | SERVICE_CONTROL_SHUTDOWN | SERVICE_CONTROL_PRESHUTDOWN => {
             STOP_FLAG.store(true, Ordering::SeqCst);
+            signal_wake_event();
+            report_status(SERVICE_STOP_PENDING.0, 0, 1, 3000);
+            NO_ERROR.0
+        }
+        SERVICE_CONTROL_POWEREVENT => {
+            match event_type {
+                PBT_APMSUSPEND => {
+                    SYSTEM_SUSPENDING.store(true, Ordering::SeqCst);
+                    signal_wake_event();
+                }
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                    SYSTEM_SUSPENDING.store(false, Ordering::SeqCst);
+                    SUPPRESSED_SESSION_ID.store(u32::MAX, Ordering::SeqCst);
+                    signal_wake_event();
+                }
+                _ => {}
+            }
             NO_ERROR.0
         }
         SERVICE_CONTROL_SESSIONCHANGE => {
             SESSION_GEN.fetch_add(1, Ordering::SeqCst);
+            let session_id = if !event_data.is_null() {
+                let note = &*(event_data as *const WTSSESSION_NOTIFICATION);
+                note.dwSessionId
+            } else {
+                u32::MAX
+            };
+            match classify_session_change(event_type, session_id) {
+                SessionChangeEffect::SuppressSession(sid) => {
+                    SUPPRESSED_SESSION_ID.store(sid, Ordering::SeqCst);
+                    signal_wake_event();
+                }
+                SessionChangeEffect::ClearSuppression => {
+                    SUPPRESSED_SESSION_ID.store(u32::MAX, Ordering::SeqCst);
+                    signal_wake_event();
+                }
+                SessionChangeEffect::NoChange => {}
+            }
             NO_ERROR.0
         }
         _ => NO_ERROR.0,
@@ -88,12 +144,19 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         return;
     };
     *STATUS_HANDLE_PTR.lock().unwrap() = Some(handle.0 as isize);
-    let _ = STATUS_HANDLE.load(Ordering::Relaxed);
 
-    report_status(SERVICE_START_PENDING.0, 0, 3000);
+    report_status(SERVICE_START_PENDING.0, 0, 1, 3000);
+    if let Ok(ev) = CreateEventW(None, false, false, PCWSTR::null()) {
+        WAKE_EVENT_PTR.store(ev.0 as isize, Ordering::Release);
+    }
     report_status(
         SERVICE_RUNNING.0,
-        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE,
+        SERVICE_ACCEPT_STOP
+            | SERVICE_ACCEPT_SHUTDOWN
+            | SERVICE_ACCEPT_PRESHUTDOWN
+            | SERVICE_ACCEPT_SESSIONCHANGE
+            | SERVICE_ACCEPT_POWEREVENT,
+        0,
         0,
     );
 
@@ -103,13 +166,21 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut PWSTR) {
         .unwrap_or_else(|| PathBuf::from(crate::service::install::SHARED_CONFIG_PATH));
 
     let Ok(exe_path) = std::env::current_exe() else {
-        report_status(SERVICE_STOPPED.0, 0, 0);
+        let wake_raw = WAKE_EVENT_PTR.swap(0, Ordering::AcqRel);
+        if wake_raw != 0 {
+            let _ = CloseHandle(HANDLE(wake_raw as *mut c_void));
+        }
+        report_status(SERVICE_STOPPED.0, 0, 0, 0);
         return;
     };
 
     supervisor_loop(&exe_path, &cfg_path);
 
-    report_status(SERVICE_STOPPED.0, 0, 0);
+    let wake_raw = WAKE_EVENT_PTR.swap(0, Ordering::AcqRel);
+    if wake_raw != 0 {
+        let _ = CloseHandle(HANDLE(wake_raw as *mut c_void));
+    }
+    report_status(SERVICE_STOPPED.0, 0, 0, 0);
 }
 
 /// Enables a single privilege in the given token. Returns false when the privilege is absent from
@@ -180,6 +251,54 @@ fn enable_service_privileges() {
     }
 }
 
+fn is_session_connectable(session_id: u32) -> bool {
+    if session_id == u32::MAX {
+        return false;
+    }
+    unsafe {
+        let mut buf = PWSTR::null();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session_id,
+            WTSConnectState,
+            &mut buf,
+            &mut bytes,
+        )
+        .is_ok()
+        {
+            let connectable = if !buf.0.is_null()
+                && (bytes as usize) >= std::mem::size_of::<WTS_CONNECTSTATE_CLASS>()
+            {
+                let state = *(buf.0 as *const WTS_CONNECTSTATE_CLASS);
+                state == WTSActive || state == WTSConnected
+            } else {
+                true
+            };
+            if !buf.0.is_null() {
+                WTSFreeMemory(buf.0 as *mut c_void);
+            }
+            return connectable;
+        }
+    }
+    true
+}
+
+fn terminate_child(child_handle: &mut Option<HANDLE>, child_session_id: &mut u32, wait_ms: u32) {
+    if let Some(h) = child_handle.take() {
+        unsafe {
+            if WaitForSingleObject(h, 0).0 != 0 {
+                let _ = TerminateProcess(h, 0);
+                if wait_ms > 0 {
+                    let _ = WaitForSingleObject(h, wait_ms);
+                }
+            }
+            let _ = CloseHandle(h);
+        }
+    }
+    *child_session_id = u32::MAX;
+}
+
 fn supervisor_loop(exe_path: &Path, cfg_path: &Path) {
     enable_service_privileges();
 
@@ -199,53 +318,84 @@ fn supervisor_loop(exe_path: &Path, cfg_path: &Path) {
                 let mut exit_code = 0u32;
                 unsafe {
                     let _ = GetExitCodeProcess(h, &mut exit_code);
-                }
-                let uptime = child_spawned_at.elapsed();
-                tracing::warn!(
-                    "Session {} agent exited (code={}, uptime={:.1}s)",
-                    child_session_id,
-                    exit_code,
-                    uptime.as_secs_f64()
-                );
-                if uptime < std::time::Duration::from_secs(3) {
-                    crash_count = crash_count.saturating_add(1);
-                } else {
-                    crash_count = 0;
-                }
-                unsafe {
                     let _ = CloseHandle(h);
                 }
+                let uptime = child_spawned_at.elapsed();
                 child_handle = None;
+                if exit_code == AGENT_EXIT_CODE_SESSION_ENDING {
+                    tracing::info!(
+                        "Session {} agent exited for session/system shutdown (uptime={:.1}s)",
+                        child_session_id,
+                        uptime.as_secs_f64()
+                    );
+                    if child_session_id != u32::MAX {
+                        SUPPRESSED_SESSION_ID.store(child_session_id, Ordering::SeqCst);
+                    }
+                    crash_count = 0;
+                } else {
+                    tracing::warn!(
+                        "Session {} agent exited (code={}, uptime={:.1}s)",
+                        child_session_id,
+                        exit_code,
+                        uptime.as_secs_f64()
+                    );
+                    if uptime < std::time::Duration::from_secs(3) {
+                        crash_count = crash_count.saturating_add(1);
+                    } else {
+                        crash_count = 0;
+                    }
+                }
                 child_session_id = u32::MAX;
             }
         }
 
-        // Only restart child if active console session changed to a valid console session
-        if active_session != u32::MAX && active_session != child_session_id {
-            if let Some(h) = child_handle.take() {
-                unsafe {
-                    let _ = TerminateProcess(h, 0);
-                    let _ = WaitForSingleObject(h, 2000);
-                    let _ = CloseHandle(h);
+        if STOP_FLAG.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let suspending = SYSTEM_SUSPENDING.load(Ordering::SeqCst);
+        let suppressed = SUPPRESSED_SESSION_ID.load(Ordering::SeqCst);
+        let connectable = if active_session == u32::MAX || suspending || active_session == suppressed {
+            false
+        } else {
+            is_session_connectable(active_session)
+        };
+
+        match decide_console_agent_action(active_session, suspending, suppressed, connectable) {
+            ConsoleSessionAction::PauseAndTerminate => {
+                if child_handle.is_some() {
+                    tracing::info!(
+                        "pausing Session {} agent due to session logoff/suspend/shutdown",
+                        child_session_id
+                    );
+                    terminate_child(&mut child_handle, &mut child_session_id, 1000);
+                    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
                 }
+                spawn_failures = 0;
             }
-            match spawn_agent_in_session(exe_path, cfg_path, active_session) {
-                Ok(h) => {
-                    tracing::info!("spawned Session {} agent process", active_session);
-                    child_handle = Some(h);
-                    child_session_id = active_session;
-                    child_spawned_at = std::time::Instant::now();
-                    spawn_failures = 0;
-                }
-                Err(e) => {
-                    spawn_failures = spawn_failures.saturating_add(1);
-                    // Log the first failure and then at most every ~10s to avoid flooding the log.
-                    if spawn_failures == 1 || spawn_failures % 20 == 0 {
-                        tracing::error!(
-                            "failed to spawn Session {} agent (attempt {}): {e:#}",
-                            active_session,
-                            spawn_failures
-                        );
+            ConsoleSessionAction::WaitForSession => {}
+            ConsoleSessionAction::RunAgent(target_session) => {
+                if target_session != child_session_id && !STOP_FLAG.load(Ordering::SeqCst) {
+                    terminate_child(&mut child_handle, &mut child_session_id, 1500);
+                    match spawn_agent_in_session(exe_path, cfg_path, target_session) {
+                        Ok(h) => {
+                            tracing::info!("spawned Session {} agent process", target_session);
+                            child_handle = Some(h);
+                            child_session_id = target_session;
+                            child_spawned_at = std::time::Instant::now();
+                            spawn_failures = 0;
+                        }
+                        Err(e) => {
+                            spawn_failures = spawn_failures.saturating_add(1);
+                            // Log the first failure and then at most every ~10s to avoid flooding the log.
+                            if spawn_failures == 1 || spawn_failures % 20 == 0 {
+                                tracing::error!(
+                                    "failed to spawn Session {} agent (attempt {}): {e:#}",
+                                    target_session,
+                                    spawn_failures
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -257,17 +407,24 @@ fn supervisor_loop(exe_path: &Path, cfg_path: &Path) {
         sleep_interruptible(500 + failure_delay.min(4500) + crash_delay.min(10_000));
     }
 
-    if let Some(h) = child_handle.take() {
-        unsafe {
-            let _ = TerminateProcess(h, 0);
-            let _ = WaitForSingleObject(h, 2000);
-            let _ = CloseHandle(h);
-        }
-    }
+    terminate_child(&mut child_handle, &mut child_session_id, 500);
     let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
 }
 
 fn sleep_interruptible(total_ms: u64) {
+    if STOP_FLAG.load(Ordering::SeqCst) {
+        return;
+    }
+    let wake_raw = WAKE_EVENT_PTR.load(Ordering::Acquire);
+    if wake_raw != 0 {
+        unsafe {
+            let _ = WaitForSingleObject(
+                HANDLE(wake_raw as *mut c_void),
+                total_ms.min(u32::MAX as u64) as u32,
+            );
+        }
+        return;
+    }
     let mut elapsed = 0u64;
     while elapsed < total_ms && !STOP_FLAG.load(Ordering::SeqCst) {
         let step = (total_ms - elapsed).min(100);

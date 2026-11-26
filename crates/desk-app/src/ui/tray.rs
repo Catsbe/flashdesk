@@ -32,8 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, GWLP_USERDATA, HICON, ICONINFO, IDI_APPLICATION, IsWindow, IsWindowVisible,
     MF_SEPARATOR, MF_STRING, MSG, SW_RESTORE, SW_SHOW, SW_SHOWNA, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY,
-    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_QUERYENDSESSION, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const TRAY_ICON_UID: u32 = 1;
@@ -159,6 +159,7 @@ pub struct TrayHandle {
     tray_hwnd: Arc<AtomicIsize>,
     main_hwnd: Arc<AtomicIsize>,
     quit_flag: Arc<AtomicBool>,
+    system_shutdown: Arc<AtomicBool>,
     active: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -168,17 +169,26 @@ impl TrayHandle {
         let tray_hwnd = Arc::new(AtomicIsize::new(0));
         let main_hwnd_arc = Arc::new(AtomicIsize::new(main_hwnd));
         let quit_flag = Arc::new(AtomicBool::new(false));
+        let system_shutdown = Arc::new(AtomicBool::new(false));
         let active = Arc::new(AtomicBool::new(false));
 
         let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
         let t_tray_hwnd = Arc::clone(&tray_hwnd);
         let t_main_hwnd = Arc::clone(&main_hwnd_arc);
         let t_quit = Arc::clone(&quit_flag);
+        let t_sys_shutdown = Arc::clone(&system_shutdown);
 
         let thread = std::thread::Builder::new()
             .name("flashdesk-tray".into())
             .spawn(move || {
-                run_tray_thread(egui_ctx, t_tray_hwnd, t_main_hwnd, t_quit, ready_tx);
+                run_tray_thread(
+                    egui_ctx,
+                    t_tray_hwnd,
+                    t_main_hwnd,
+                    t_quit,
+                    t_sys_shutdown,
+                    ready_tx,
+                );
             })
             .ok();
 
@@ -193,6 +203,7 @@ impl TrayHandle {
             tray_hwnd,
             main_hwnd: main_hwnd_arc,
             quit_flag,
+            system_shutdown,
             active,
             thread,
         }
@@ -210,6 +221,10 @@ impl TrayHandle {
 
     pub fn quit_requested(&self) -> bool {
         self.quit_flag.load(Ordering::Acquire)
+    }
+
+    pub fn system_shutdown(&self) -> bool {
+        self.system_shutdown.load(Ordering::Acquire)
     }
 
     pub fn shutdown(&mut self) {
@@ -241,6 +256,7 @@ struct TrayWndState {
     egui_ctx: egui::Context,
     main_hwnd: Arc<AtomicIsize>,
     quit_flag: Arc<AtomicBool>,
+    system_shutdown: Arc<AtomicBool>,
     taskbar_created_msg: u32,
     hicon: HICON,
     icon_added: bool,
@@ -251,6 +267,7 @@ fn run_tray_thread(
     tray_hwnd_out: Arc<AtomicIsize>,
     main_hwnd: Arc<AtomicIsize>,
     quit_flag: Arc<AtomicBool>,
+    system_shutdown: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<bool>,
 ) {
     unsafe {
@@ -270,6 +287,7 @@ fn run_tray_thread(
             egui_ctx,
             main_hwnd,
             quit_flag,
+            system_shutdown,
             taskbar_created_msg,
             hicon,
             icon_added: false,
@@ -368,6 +386,17 @@ unsafe extern "system" fn tray_wnd_proc(
     }
 
     match msg {
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                state.system_shutdown.store(true, Ordering::Release);
+                state.quit_flag.store(true, Ordering::Release);
+                // Do not wait for winit (which ignores WM_ENDSESSION), Shell_NotifyIconW, or
+                // stop_service_for_app_exit() during OS shutdown/Fast Startup.
+                std::process::exit(0);
+            }
+            LRESULT(0)
+        }
         WM_TRAY_CALLBACK => {
             let ev = (lparam.0 as u32) & 0xFFFF;
             match ev {
