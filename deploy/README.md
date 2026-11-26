@@ -58,9 +58,13 @@ sudo bash deploy-relay.sh --uninstall
 
 ---
 
-## 四、升级中转二进制（2026-11 低延迟版）
+## 四、升级中转二进制（支持自动更新通道 + 低延迟转发）
 
-2026-11 起中转端对**控屏/视频通道**改用 32 KB 转发缓冲 + `TCP_NOTSENT_LOWAT`（文件通道仍为 512 KB），配合客户端的帧确认流控把 5M 小水管上的画面延迟压在 ~100 ms 量级。只需替换二进制，配置与部署脚本不变：
+2026-11 起中转端支持：
+1. **控屏/视频通道低延迟**：32 KB 转发缓冲 + `TCP_NOTSENT_LOWAT`（文件与更新通道仍为 512 KB），配合客户端帧确认流控将 5M 小水管画面延迟压在 ~100 ms 量级。
+2. **`UpdateChannel` 差量补丁分发与远程检查更新转发**（需保持 `--state-dir /var/lib/flashdesk`，[deploy-relay.sh](deploy-relay.sh) 已默认开启，更新包存放于 `/var/lib/flashdesk/updates/`，详见 [../docs/AUTO_UPDATE_AND_INSTALLER.md](../docs/AUTO_UPDATE_AND_INSTALLER.md)）。
+
+只需替换二进制，配置与部署脚本不变：
 
 ```bash
 sudo systemctl stop flashdesk-relay

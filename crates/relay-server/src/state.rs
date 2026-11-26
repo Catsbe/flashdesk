@@ -1,3 +1,4 @@
+use crate::updates::UpdateStore;
 use protocol::auth::RevocationCommand;
 use protocol::relay::{OnlineDevice, PresenceServerMsg};
 use protocol::ChannelKind;
@@ -48,6 +49,7 @@ pub struct RelayState {
     static_revoked_ids: Vec<Uuid>,
     dynamic_revocations: RwLock<DynamicRevocations>,
     pub pending_timeout: Duration,
+    pub updates: Arc<UpdateStore>,
     peers: Mutex<HashMap<Uuid, Vec<PeerEntry>>>,
     pending_tunnels: Mutex<HashMap<(Uuid, ChannelKind), PendingTunnel>>,
     next_conn_seq: AtomicU64,
@@ -68,6 +70,7 @@ impl RelayState {
         pending_timeout: Duration,
         state_dir: Option<PathBuf>,
     ) -> Self {
+        let updates = Arc::new(UpdateStore::new(state_dir.as_deref(), &root_pubkey));
         let state_path = state_dir.map(|d| d.join("revoked.json"));
         let mut loaded = PersistedRevocations::default();
         if let Some(path) = &state_path {
@@ -96,6 +99,7 @@ impl RelayState {
                 state_path,
             }),
             pending_timeout,
+            updates,
             peers: Mutex::new(HashMap::new()),
             pending_tunnels: Mutex::new(HashMap::new()),
             next_conn_seq: AtomicU64::new(1),

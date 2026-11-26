@@ -950,3 +950,221 @@ async fn relay_remote_revocation_kicks_peer_and_persists() {
 
     let _ = std::fs::remove_dir_all(&state_dir);
 }
+
+#[tokio::test]
+async fn relay_update_publish_download_and_remote_trigger() {
+    use protocol::patch::{apply_delta_patch, compress_full, create_delta_patch, MAX_UNCOMPRESSED_SIZE};
+    use protocol::update::{
+        sha256_bytes, DeltaPatchInfo, FullPackageInfo, PublishFileSpec, UpdateClientMsg,
+        UpdateManifest, UpdateServerMsg,
+    };
+    use protocol::unix_timestamp_secs;
+
+    let root = RootKeypair::generate();
+    let other_root = RootKeypair::generate();
+    let admin_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+    let admin_ident = root.sign_device_cert(admin_id, "AdminPC", 3600);
+    let peer_ident = root.sign_device_cert(peer_id, "RemoteHost", 3600);
+    let root_pub = root.pubkey_bytes();
+
+    let state_dir = std::env::temp_dir().join(format!("flashdesk-upd-e2e-{}", Uuid::new_v4()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = Arc::new(RelayState::new_with_state_dir(
+        root_pub,
+        vec![],
+        Duration::from_secs(5),
+        Some(state_dir.clone()),
+    ));
+    let server_task = tokio::spawn(run_server(listener, Arc::clone(&state)));
+
+    // Prepare v1 -> v2 binaries, full deflate, and FLDP delta patch.
+    let old_bin = b"FLASHDESK-OLD-BINARY-0123456789".repeat(512);
+    let mut new_bin = old_bin.clone();
+    new_bin[4096..4128].fill(0x5A);
+    let full_z = compress_full(&new_bin).unwrap();
+    let delta = create_delta_patch(&old_bin, &new_bin).unwrap();
+
+    let full_name = "flashdesk-core-0.2.0.exe.deflate".to_string();
+    let delta_name = "flashdesk-0.1.0-to-0.2.0.fldp".to_string();
+    let manifest = UpdateManifest {
+        format_version: 1,
+        version: "0.2.0".into(),
+        min_base_version: "1.0.0".into(),
+        released_at: unix_timestamp_secs(),
+        notes: "e2e test release".into(),
+        full: FullPackageInfo {
+            filename: full_name.clone(),
+            size: full_z.len() as u64,
+            sha256: sha256_bytes(&full_z),
+            target_size: new_bin.len() as u64,
+            target_sha256: sha256_bytes(&new_bin),
+        },
+        deltas: vec![DeltaPatchInfo {
+            from_version: "0.1.0".into(),
+            from_sha256: sha256_bytes(&old_bin),
+            filename: delta_name.clone(),
+            size: delta.len() as u64,
+            sha256: sha256_bytes(&delta),
+        }],
+    };
+    let files = vec![
+        PublishFileSpec {
+            filename: full_name.clone(),
+            size: full_z.len() as u64,
+            sha256: sha256_bytes(&full_z),
+        },
+        PublishFileSpec {
+            filename: delta_name.clone(),
+            size: delta.len() as u64,
+            sha256: sha256_bytes(&delta),
+        },
+    ];
+
+    // 1) Foreign-signed manifest must be rejected by the relay even from an authenticated client.
+    let mut upd_conn = connect_and_auth_relay(addr, &admin_ident, ConnectionPurpose::UpdateChannel)
+        .await
+        .unwrap();
+    let bad_signed = other_root.sign_update_manifest(manifest.clone());
+    write_frame(
+        &mut upd_conn,
+        &bincode::serialize(&UpdateClientMsg::BeginPublish {
+            manifest: bad_signed,
+            files: files.clone(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let resp: UpdateServerMsg = bincode::deserialize(&read_frame(&mut upd_conn).await.unwrap()).unwrap();
+    assert!(matches!(resp, UpdateServerMsg::Error(_)));
+
+    // 2) Valid root-signed BeginPublish -> UploadChunk -> CommitPublish succeeds.
+    let good_signed = root.sign_update_manifest(manifest.clone());
+    write_frame(
+        &mut upd_conn,
+        &bincode::serialize(&UpdateClientMsg::BeginPublish {
+            manifest: good_signed,
+            files,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let resp: UpdateServerMsg = bincode::deserialize(&read_frame(&mut upd_conn).await.unwrap()).unwrap();
+    assert!(matches!(resp, UpdateServerMsg::PublishReady));
+
+    for (name, bytes) in [(&full_name, &full_z), (&delta_name, &delta)] {
+        write_frame(
+            &mut upd_conn,
+            &bincode::serialize(&UpdateClientMsg::UploadChunk {
+                filename: name.clone(),
+                offset: 0,
+                data: bytes.clone(),
+                eof: true,
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let ack: UpdateServerMsg = bincode::deserialize(&read_frame(&mut upd_conn).await.unwrap()).unwrap();
+        assert!(matches!(ack, UpdateServerMsg::UploadAck { .. }));
+    }
+
+    write_frame(
+        &mut upd_conn,
+        &bincode::serialize(&UpdateClientMsg::CommitPublish).unwrap(),
+    )
+    .await
+    .unwrap();
+    let committed: UpdateServerMsg = bincode::deserialize(&read_frame(&mut upd_conn).await.unwrap()).unwrap();
+    assert!(matches!(
+        committed,
+        UpdateServerMsg::PublishCommitted { files: 2, .. }
+    ));
+
+    // 3) Peer downloads manifest & delta chunk, verifies signature and applies patch.
+    let mut dl_conn = connect_and_auth_relay(addr, &peer_ident, ConnectionPurpose::UpdateChannel)
+        .await
+        .unwrap();
+    write_frame(&mut dl_conn, &bincode::serialize(&UpdateClientMsg::GetManifest).unwrap())
+        .await
+        .unwrap();
+    let got_m = match bincode::deserialize::<UpdateServerMsg>(&read_frame(&mut dl_conn).await.unwrap()).unwrap() {
+        UpdateServerMsg::Manifest(Some(m)) => m,
+        other => panic!("unexpected manifest response: {other:?}"),
+    };
+    got_m.verify(&root_pub, unix_timestamp_secs()).unwrap();
+    assert_eq!(got_m.manifest.version, "0.2.0");
+
+    write_frame(
+        &mut dl_conn,
+        &bincode::serialize(&UpdateClientMsg::DownloadChunk {
+            filename: delta_name,
+            offset: 0,
+            max_len: 1024 * 1024,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let dl_delta = match bincode::deserialize::<UpdateServerMsg>(&read_frame(&mut dl_conn).await.unwrap()).unwrap() {
+        UpdateServerMsg::ChunkData { data, eof: true, .. } => data,
+        other => panic!("unexpected chunk response: {other:?}"),
+    };
+    assert_eq!(sha256_bytes(&dl_delta), got_m.manifest.deltas[0].sha256);
+    let patched = apply_delta_patch(&old_bin, &dl_delta, MAX_UNCOMPRESSED_SIZE).unwrap();
+    assert_eq!(patched, new_bin);
+
+    // 4) Remote update check trigger via Presence delivers CheckUpdateNow to target peer.
+    let mut admin_pres = connect_and_auth_relay(addr, &admin_ident, ConnectionPurpose::Presence)
+        .await
+        .unwrap();
+    let mut peer_pres = connect_and_auth_relay(addr, &peer_ident, ConnectionPurpose::Presence)
+        .await
+        .unwrap();
+    write_frame(
+        &mut peer_pres,
+        &bincode::serialize(&PresenceClientMsg::UpdateInfo {
+            monitor_count: 1,
+            encode_codecs: vec![],
+            decode_codecs: vec![],
+            os: "Windows".into(),
+            accept_incoming: true,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    write_frame(
+        &mut admin_pres,
+        &bincode::serialize(&PresenceClientMsg::RequestPeerUpdateCheck {
+            target_device_id: peer_id,
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let mut saw_trigger = false;
+    for _ in 0..8 {
+        let raw = tokio::time::timeout(Duration::from_secs(2), read_frame(&mut peer_pres))
+            .await
+            .unwrap()
+            .unwrap();
+        if let PresenceServerMsg::CheckUpdateNow { from_device_id, .. } =
+            bincode::deserialize(&raw).unwrap()
+        {
+            assert_eq!(from_device_id, admin_id);
+            saw_trigger = true;
+            break;
+        }
+    }
+    assert!(saw_trigger, "target peer should receive CheckUpdateNow");
+
+    server_task.abort();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}

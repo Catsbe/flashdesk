@@ -10,6 +10,7 @@ mod service;
 mod timing;
 mod transfer;
 mod ui;
+mod update;
 mod vdd;
 
 use anyhow::Result;
@@ -69,6 +70,12 @@ struct Cli {
     /// Stop & start Windows SYSTEM service again, e.g. after updating flashdesk.exe (requires Administrator)
     #[arg(long)]
     restart_service: bool,
+    /// Start an already-installed Windows SYSTEM service and grant interactive user control (requires Administrator)
+    #[arg(long)]
+    start_service: bool,
+    /// Stop Windows SYSTEM service and grant interactive user control (requires Administrator)
+    #[arg(long)]
+    stop_service: bool,
     /// Copy config file to C:\ProgramData\FlashDesk\config.json (requires Administrator if protected)
     #[arg(long)]
     sync_service_config: bool,
@@ -112,6 +119,20 @@ struct Cli {
     /// --link-bench: disable frame acks (emulates the legacy transport for comparison)
     #[arg(long)]
     bench_no_ack: bool,
+    /// Wait for the given PID to exit before acquiring the GUI single-instance mutex
+    #[arg(long)]
+    wait_pid: Option<u32>,
+    /// Internal elevated helper: move a verified staged flashdesk-core.exe into versions/ and update state.json
+    #[arg(long)]
+    apply_staged_update: bool,
+    #[arg(long)]
+    install_dir: Option<PathBuf>,
+    #[arg(long)]
+    staged: Option<PathBuf>,
+    #[arg(long)]
+    version: Option<String>,
+    #[arg(long)]
+    sha256: Option<String>,
 }
 
 /// Re-attaches stdout/stderr to the caller's terminal for CLI invocations when built with
@@ -268,7 +289,10 @@ fn main() -> Result<()> {
     } else if cli.install_service
         || cli.uninstall_service
         || cli.restart_service
+        || cli.start_service
+        || cli.stop_service
         || cli.sync_service_config
+        || cli.apply_staged_update
         || cli.self_test
     {
         init_logging(None);
@@ -298,10 +322,31 @@ fn main() -> Result<()> {
     if cli.restart_service {
         return service::install::restart_service();
     }
+    if cli.start_service {
+        return service::install::start_service_elevated();
+    }
+    if cli.stop_service {
+        return service::install::stop_service_elevated();
+    }
     if cli.sync_service_config {
         let src = cli.config.unwrap_or_else(AppConfig::resolve_path);
         sync_config_file_to_program_data(&src)?;
         return Ok(());
+    }
+    if cli.apply_staged_update {
+        let dir = cli
+            .install_dir
+            .ok_or_else(|| anyhow::anyhow!("--install-dir is required"))?;
+        let staged = cli
+            .staged
+            .ok_or_else(|| anyhow::anyhow!("--staged is required"))?;
+        let ver = cli
+            .version
+            .ok_or_else(|| anyhow::anyhow!("--version is required"))?;
+        let sha = cli
+            .sha256
+            .ok_or_else(|| anyhow::anyhow!("--sha256 is required"))?;
+        return update::apply_staged_update_cli(&dir, &staged, &ver, &sha);
     }
     if cli.service {
         let cfg_path = cli
@@ -342,6 +387,10 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
         return Ok(());
+    }
+
+    if let Some(pid) = cli.wait_pid {
+        update::wait_for_pid_exit(pid, Duration::from_secs(6));
     }
 
     let Some(_single_instance) = ui::tray::try_acquire_gui_instance() else {
@@ -415,6 +464,9 @@ fn main() -> Result<()> {
         return Err(anyhow::anyhow!("eframe exited with error: {e}"));
     }
 
+    drop(_rt_guard);
+    rt.shutdown_timeout(Duration::from_secs(2));
+
     Ok(())
 }
 
@@ -429,6 +481,8 @@ fn run_headless_agent(cfg_path: PathBuf) -> Result<()> {
         let cfg_arc = Arc::new(Mutex::new(cfg.clone()));
         let status = Arc::new(Mutex::new(RelayStatus::default()));
         let noop_repaint: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let active_sessions = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (update_trigger_tx, update_trigger_rx) = tokio::sync::mpsc::unbounded_channel();
 
         let relay_tx = spawn_relay_manager(
             cfg.clone(),
@@ -437,8 +491,16 @@ fn run_headless_agent(cfg_path: PathBuf) -> Result<()> {
             true,
             status,
             noop_repaint,
+            Arc::clone(&active_sessions),
+            Some(update_trigger_tx),
         );
-        spawn_direct_listener(Arc::clone(&cfg_arc), caps, true);
+        spawn_direct_listener(
+            Arc::clone(&cfg_arc),
+            caps,
+            true,
+            Arc::clone(&active_sessions),
+        );
+        update::spawn_agent_update_task(Arc::clone(&cfg_arc), update_trigger_rx);
 
         // Publish liveness heartbeat so the desktop GUI can tell "service running + agent alive"
         // apart from "service running but agent dead" and take over hosting when needed.
@@ -447,10 +509,18 @@ fn run_headless_agent(cfg_path: PathBuf) -> Result<()> {
         let elevated = service::health::current_process_elevated();
         let started_at = service::health::unix_now();
         tracing::info!(
-            "agent started: pid={pid} session={session_id} elevated={elevated} config={}",
+            "agent started: pid={pid} session={session_id} elevated={elevated} version={} config={}",
+            update::CORE_VERSION,
             cfg_path.display()
         );
-        if let Err(e) = service::health::write_agent_status(pid, session_id, elevated, started_at) {
+        if let Err(e) = service::health::write_agent_status(
+            pid,
+            session_id,
+            elevated,
+            started_at,
+            update::CORE_VERSION,
+            active_sessions.load(std::sync::atomic::Ordering::Relaxed),
+        ) {
             tracing::warn!("failed to publish agent heartbeat: {e}");
         }
 
@@ -460,9 +530,14 @@ fn run_headless_agent(cfg_path: PathBuf) -> Result<()> {
 
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            if let Err(e) =
-                service::health::write_agent_status(pid, session_id, elevated, started_at)
-            {
+            if let Err(e) = service::health::write_agent_status(
+                pid,
+                session_id,
+                elevated,
+                started_at,
+                update::CORE_VERSION,
+                active_sessions.load(std::sync::atomic::Ordering::Relaxed),
+            ) {
                 tracing::warn!("failed to refresh agent heartbeat: {e}");
             }
             let cur_mtime = std::fs::metadata(&cfg_path)

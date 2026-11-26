@@ -9,14 +9,17 @@ use protocol::framing::{read_frame, write_frame};
 use protocol::noise::NoiseStream;
 use protocol::relay::{ConnectionPurpose, PresenceClientMsg, PresenceServerMsg};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 pub enum RelayCommand {
     ReloadConfig(AppConfig),
     RefreshDevices,
     SyncRevocations(protocol::auth::RevocationCommand),
+    RequestPeerUpdateCheck(Uuid),
 }
 
 pub fn spawn_relay_manager(
@@ -26,12 +29,14 @@ pub fn spawn_relay_manager(
     agent_mode: bool,
     status: Arc<Mutex<RelayStatus>>,
     repaint: Arc<dyn Fn() + Send + Sync>,
+    active_sessions: Arc<AtomicU32>,
+    update_trigger_tx: Option<mpsc::UnboundedSender<()>>,
 ) -> mpsc::UnboundedSender<RelayCommand> {
     let (tx, mut rx) = mpsc::unbounded_channel::<RelayCommand>();
 
     tokio::spawn(async move {
         let mut cfg = initial_cfg;
-        let pending_channels = Arc::new(PendingHostChannels::new());
+        let pending_channels = Arc::new(PendingHostChannels::with_session_counter(active_sessions));
 
         loop {
             while let Ok(cmd) = rx.try_recv() {
@@ -49,7 +54,8 @@ pub fn spawn_relay_manager(
                         continue;
                     }
                     Some(RelayCommand::RefreshDevices)
-                    | Some(RelayCommand::SyncRevocations(_)) => continue,
+                    | Some(RelayCommand::SyncRevocations(_))
+                    | Some(RelayCommand::RequestPeerUpdateCheck(_)) => continue,
                     None => break,
                 }
             };
@@ -63,7 +69,8 @@ pub fn spawn_relay_manager(
                         continue;
                     }
                     Some(RelayCommand::RefreshDevices)
-                    | Some(RelayCommand::SyncRevocations(_)) => continue,
+                    | Some(RelayCommand::SyncRevocations(_))
+                    | Some(RelayCommand::RequestPeerUpdateCheck(_)) => continue,
                     None => break,
                 }
             };
@@ -78,6 +85,7 @@ pub fn spawn_relay_manager(
                 &pending_channels,
                 &status,
                 &repaint,
+                &update_trigger_tx,
                 &mut rx,
             )
             .await;
@@ -97,7 +105,8 @@ pub fn spawn_relay_manager(
                             match cmd {
                                 Some(RelayCommand::ReloadConfig(new_cfg)) => cfg = new_cfg,
                                 Some(RelayCommand::RefreshDevices)
-                                | Some(RelayCommand::SyncRevocations(_)) => {}
+                                | Some(RelayCommand::SyncRevocations(_))
+                                | Some(RelayCommand::RequestPeerUpdateCheck(_)) => {}
                                 None => break,
                             }
                         }
@@ -139,6 +148,7 @@ async fn run_presence_once(
     pending: &Arc<PendingHostChannels>,
     status: &Arc<Mutex<RelayStatus>>,
     repaint: &Arc<dyn Fn() + Send + Sync>,
+    update_trigger_tx: &Option<mpsc::UnboundedSender<()>>,
     cmd_rx: &mut mpsc::UnboundedReceiver<RelayCommand>,
 ) -> PresenceOutcome {
     let stream = match connect_and_auth_relay(
@@ -247,6 +257,13 @@ async fn run_presence_once(
                             if write_frame(&mut writer, &bytes).await.is_err() {
                                 return PresenceOutcome::Disconnected("同步吊销列表发送失败".into());
                             }
+                        }
+                    }
+                    Some(RelayCommand::RequestPeerUpdateCheck(target_device_id)) => {
+                        if let Ok(bytes) = bincode::serialize(
+                            &PresenceClientMsg::RequestPeerUpdateCheck { target_device_id },
+                        ) {
+                            let _ = write_frame(&mut writer, &bytes).await;
                         }
                     }
                     None => return PresenceOutcome::Exit,
@@ -395,6 +412,19 @@ async fn run_presence_once(
                     PresenceServerMsg::RevocationsSynced { count, issued_at } => {
                         status.lock().unwrap().last_revocation_sync = Some((count, issued_at));
                         repaint();
+                    }
+                    PresenceServerMsg::CheckUpdateNow {
+                        from_device_id,
+                        from_device_name,
+                    } => {
+                        tracing::info!(
+                            "received remote CheckUpdateNow from {} ({})",
+                            from_device_name,
+                            from_device_id
+                        );
+                        if let Some(tx) = update_trigger_tx {
+                            let _ = tx.send(());
+                        }
                     }
                 }
             }

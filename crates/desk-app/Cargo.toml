@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 arboard = "3"
+base-common = { path = "../base-common" }
 bincode = "1"
 base64 = "0.22"
 bytemuck = "1"

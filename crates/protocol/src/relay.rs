@@ -29,6 +29,8 @@ pub enum ConnectionPurpose {
         channel: ChannelKind,
         peer_device_id: Uuid,
     },
+    /// Authenticated update manifest query, artifact download, or root-signed release push.
+    UpdateChannel,
 }
 
 impl ConnectionPurpose {
@@ -108,6 +110,9 @@ pub enum PresenceClientMsg {
     Heartbeat(u64),
     SyncRevocations(crate::auth::RevocationCommand),
     SetDisplayName(String),
+    RequestPeerUpdateCheck {
+        target_device_id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,4 +130,78 @@ pub enum PresenceServerMsg {
         count: usize,
         issued_at: u64,
     },
+    CheckUpdateNow {
+        from_device_id: Uuid,
+        from_device_name: String,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enum_variant_index<T: Serialize>(v: &T) -> u32 {
+        let bytes = bincode::serialize(v).unwrap();
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    /// Mixed-version relay clients and servers depend on bincode variant indices never shifting.
+    #[test]
+    fn relay_enum_variant_indices_are_stable() {
+        assert_eq!(enum_variant_index(&ConnectionPurpose::Presence), 0);
+        assert_eq!(
+            enum_variant_index(&ConnectionPurpose::OpenSession {
+                target_device_id: Uuid::nil(),
+                session_id: Uuid::nil(),
+                channel: ChannelKind::Control,
+            }),
+            1
+        );
+        assert_eq!(
+            enum_variant_index(&ConnectionPurpose::AcceptSession {
+                session_id: Uuid::nil(),
+                channel: ChannelKind::Video,
+            }),
+            2
+        );
+        assert_eq!(
+            enum_variant_index(&ConnectionPurpose::PairTunnel {
+                session_id: Uuid::nil(),
+                channel: ChannelKind::File,
+                peer_device_id: Uuid::nil(),
+            }),
+            3
+        );
+        assert_eq!(enum_variant_index(&ConnectionPurpose::UpdateChannel), 4);
+
+        assert_eq!(enum_variant_index(&PresenceClientMsg::ListDevices), 1);
+        assert_eq!(enum_variant_index(&PresenceClientMsg::Heartbeat(0)), 2);
+        assert_eq!(
+            enum_variant_index(&PresenceClientMsg::SetDisplayName(String::new())),
+            4
+        );
+        assert_eq!(
+            enum_variant_index(&PresenceClientMsg::RequestPeerUpdateCheck {
+                target_device_id: Uuid::nil(),
+            }),
+            5
+        );
+
+        assert_eq!(enum_variant_index(&PresenceServerMsg::DeviceList(vec![])), 0);
+        assert_eq!(enum_variant_index(&PresenceServerMsg::HeartbeatAck(0)), 2);
+        assert_eq!(
+            enum_variant_index(&PresenceServerMsg::RevocationsSynced {
+                count: 0,
+                issued_at: 0,
+            }),
+            4
+        );
+        assert_eq!(
+            enum_variant_index(&PresenceServerMsg::CheckUpdateNow {
+                from_device_id: Uuid::nil(),
+                from_device_name: String::new(),
+            }),
+            5
+        );
+    }
 }

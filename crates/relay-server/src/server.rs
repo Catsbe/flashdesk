@@ -157,10 +157,13 @@ async fn handle_connection(
             )
             .await
         }
+        ConnectionPurpose::UpdateChannel => {
+            crate::updates::handle_update_channel(stream, auth_req.cert, state).await
+        }
     }
 }
 
-async fn send_auth_ok(stream: &mut TcpStream) -> anyhow::Result<()> {
+pub async fn send_auth_ok(stream: &mut TcpStream) -> anyhow::Result<()> {
     let resp = bincode::serialize(&RelayAuthResponse::Ok)?;
     write_frame(stream, &resp).await?;
     Ok(())
@@ -307,6 +310,20 @@ async fn handle_presence(
                                 state
                                     .update_peer_display_name(&device_id, conn_seq, name)
                                     .await;
+                            }
+                            PresenceClientMsg::RequestPeerUpdateCheck { target_device_id } => {
+                                if let Some(target_tx) =
+                                    state.get_peer_sender(&target_device_id).await
+                                {
+                                    let _ = target_tx.try_send(PresenceServerMsg::CheckUpdateNow {
+                                        from_device_id: device_id,
+                                        from_device_name: device_name.clone(),
+                                    });
+                                } else {
+                                    let _ = tx.try_send(PresenceServerMsg::Error(
+                                        "目标设备当前不在线".into(),
+                                    ));
+                                }
                             }
                         }
                     }

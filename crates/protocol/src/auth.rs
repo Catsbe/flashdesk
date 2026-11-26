@@ -104,6 +104,20 @@ impl RootKeypair {
         cmd.root_signature = sig.to_bytes().to_vec();
         cmd
     }
+
+    /// Signs a binary update manifest so relays and clients can verify authenticity against
+    /// `root_pubkey`.
+    pub fn sign_update_manifest(
+        &self,
+        manifest: crate::update::UpdateManifest,
+    ) -> crate::update::SignedUpdateManifest {
+        let payload = manifest.canonical_bytes();
+        let sig: Signature = self.signing_key.sign(&payload);
+        crate::update::SignedUpdateManifest {
+            manifest,
+            root_signature: sig.to_bytes().to_vec(),
+        }
+    }
 }
 
 /// Root-CA-signed revocation list pushed to the relay server over an authenticated Presence link.

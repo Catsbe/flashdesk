@@ -57,6 +57,11 @@ fn toast(ui: &egui::Ui, state: &mut SettingsState, tone: Tone, text: impl Into<S
     state.toast = Some(Toast::new(ui.ctx(), tone, text));
 }
 
+pub struct SettingsOutcome {
+    pub config_changed: bool,
+    pub check_update: bool,
+}
+
 /// Returns true when the config changed and must be saved / pushed to the relay manager.
 /// Text fields only report a change once editing finishes (focus lost / Enter) and sliders once
 /// the drag ends, so typing an address no longer rewrites config.json and reconnects the relay
@@ -69,8 +74,11 @@ pub fn render_settings(
     relay_status: &Arc<Mutex<RelayStatus>>,
     relay_cmd_tx: &mpsc::UnboundedSender<RelayCommand>,
     sys: &SysStatus,
-) -> bool {
+    update_checking: bool,
+    effective_update: Option<&base_common::UpdateStatusSnapshot>,
+) -> SettingsOutcome {
     let mut changed = false;
+    let mut check_update = false;
     let mut conf = cfg.lock().unwrap();
     let st = relay_status.lock().unwrap().clone();
 
@@ -82,10 +90,15 @@ pub fn render_settings(
     theme::gap(ui);
     unattended_card(ui, state, cfg_path, &mut conf, sys, &mut changed);
     theme::gap(ui);
+    update_card(ui, &conf, sys, update_checking, effective_update, &mut check_update);
+    theme::gap(ui);
     revoke_card(ui, state, cfg_path, &mut conf, &st, relay_cmd_tx, &mut changed);
 
     theme::toast_area(ui.ctx(), &mut state.toast);
-    changed
+    SettingsOutcome {
+        config_changed: changed,
+        check_update,
+    }
 }
 
 fn build_qr_matrix(token: &str) -> Option<(usize, Vec<bool>)> {
@@ -597,7 +610,20 @@ fn unattended_card(
                 .on_hover_text(sys.service.label());
         });
         theme::form_row(ui, "", |ui| {
-            if sys.service != ServiceState::Running {
+            if sys.service == ServiceState::Stopped {
+                if theme::small_button(ui, "启动服务", Kind::Primary).clicked() {
+                    match crate::service::install::start_service_for_ui() {
+                        Ok(()) => toast(ui, state, Tone::Ok, "已启动系统服务"),
+                        Err(e) => toast(ui, state, Tone::Danger, format!("启动失败：{e}")),
+                    }
+                }
+                if theme::small_button(ui, "卸载服务", Kind::Danger).clicked() {
+                    match launch_elevated_service_cmd("--uninstall-service") {
+                        Ok(()) => toast(ui, state, Tone::Info, "已请求卸载系统服务"),
+                        Err(e) => toast(ui, state, Tone::Danger, format!("卸载失败：{e}")),
+                    }
+                }
+            } else if sys.service != ServiceState::Running {
                 if theme::small_button(ui, "安装并启动服务", Kind::Primary)
                     .on_hover_text("需要管理员权限 (UAC)")
                     .clicked()
@@ -689,6 +715,80 @@ fn unattended_card(
     });
 }
 
+fn update_card(
+    ui: &mut egui::Ui,
+    conf: &AppConfig,
+    sys: &SysStatus,
+    update_checking: bool,
+    effective_update: Option<&base_common::UpdateStatusSnapshot>,
+    check_update: &mut bool,
+) {
+    theme::card(ui, |ui| {
+        let busy = update_checking
+            || effective_update.is_some_and(|u| {
+                matches!(
+                    u.state,
+                    base_common::UpdatePhase::Checking | base_common::UpdatePhase::Downloading
+                )
+            });
+        theme::card_header(
+            ui,
+            "软件版本与补丁更新",
+            Some("通过已绑定的中转服务器获取个人根私钥签名的差量补丁，平时不主动轮询（服务在线时每 24 小时检查一次）"),
+            |ui| {
+                ui.add_enabled_ui(!busy && conf.bundle.is_some(), |ui| {
+                    let label = if busy { "检查中…" } else { "检查更新" };
+                    if theme::small_button(ui, label, Kind::Secondary).clicked() {
+                        *check_update = true;
+                    }
+                });
+            },
+        );
+
+        theme::form_row(ui, "核心版本", |ui| {
+            theme::chip(
+                ui,
+                format!("v{}", crate::update::CORE_VERSION),
+                c::ACCENT_HOVER,
+                c::ACCENT_SOFT,
+            );
+            if let Some(st) = &sys.install_state {
+                ui.label(theme::faint(format!("基座 v{}", st.base_version)));
+            }
+        });
+
+        theme::form_row(ui, "部署形态", |ui| {
+            match &sys.install_layout {
+                base_common::InstallLayout::ManagedCore { install_dir, .. }
+                | base_common::InstallLayout::ManagedRoot { install_dir } => {
+                    ui.add(
+                        egui::Label::new(theme::mono(install_dir.display().to_string()))
+                            .wrap(),
+                    );
+                }
+                base_common::InstallLayout::Portable => {
+                    ui.add(
+                        egui::Label::new(theme::muted(
+                            "单文件便携模式（使用 FlashDesk-Setup.exe 安装后可启用版本槽自动热更新）",
+                        ))
+                        .wrap(),
+                    );
+                }
+            }
+        });
+
+        if let Some(snap) = effective_update {
+            theme::form_row(ui, "更新状态", |ui| {
+                let text = snap
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| format!("{:?}", snap.state));
+                ui.add(egui::Label::new(RichText::new(text).color(c::TEXT)).wrap());
+            });
+        }
+    });
+}
+
 fn revoke_card(
     ui: &mut egui::Ui,
     state: &mut SettingsState,
@@ -717,6 +817,7 @@ fn revoke_card(
         }
 
         let mut toggle_revoke: Option<Uuid> = None;
+        let mut delete_revoked: Option<Uuid> = None;
         let mut ledger_ids: HashSet<Uuid> = HashSet::new();
 
         for rec in conf.issued_devices.iter().rev() {
@@ -746,6 +847,12 @@ fn revoke_card(
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if is_revoked {
+                            if theme::small_button(ui, "删除", Kind::Danger)
+                                .on_hover_text("从列表中删除该设备记录（凭证仍保持吊销拦截状态，无法重新连接）")
+                                .clicked()
+                            {
+                                delete_revoked = Some(rec.device_id);
+                            }
                             if theme::small_button(ui, "解除吊销", Kind::Secondary).clicked() {
                                 toggle_revoke = Some(rec.device_id);
                             }
@@ -767,31 +874,55 @@ fn revoke_card(
             });
         }
 
+        let mut has_visible_manual_revoked = false;
         for u in &conf.revoked_device_ids {
-            if !ledger_ids.contains(u) {
-                let id_str = u.to_string();
-                theme::inset(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if theme::small_button(ui, "解除吊销", Kind::Ghost).clicked() {
-                                toggle_revoke = Some(*u);
-                            }
-                            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add(egui::Label::new(theme::mono(&id_str)).truncate());
-                            });
+            if ledger_ids.contains(u) || conf.hidden_revoked_device_ids.contains(u) {
+                continue;
+            }
+            has_visible_manual_revoked = true;
+            let id_str = u.to_string();
+            theme::inset(ui, |ui| {
+                ui.horizontal(|ui| {
+                    theme::status_dot(ui, c::DANGER);
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::small_button(ui, "删除", Kind::Danger)
+                            .on_hover_text("从列表中删除该设备记录（凭证仍保持吊销拦截状态，无法重新连接）")
+                            .clicked()
+                        {
+                            delete_revoked = Some(*u);
+                        }
+                        if theme::small_button(ui, "解除吊销", Kind::Ghost).clicked() {
+                            toggle_revoke = Some(*u);
+                        }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(theme::mono(&id_str)).truncate());
+                            theme::chip(ui, "已吊销", c::DANGER, Color32::from_rgb(56, 24, 28));
                         });
                     });
                 });
-            }
+            });
         }
 
-        if conf.issued_devices.is_empty() && conf.revoked_device_ids.is_empty() {
+        if conf.issued_devices.is_empty() && !has_visible_manual_revoked {
             ui.label(theme::faint("暂无已签发的设备记录；在上方为新设备生成凭证后会自动显示在这里。"));
+        }
+
+        if let Some(uid) = delete_revoked {
+            if conf.delete_revoked_device(uid) {
+                *changed = true;
+                toast(
+                    ui,
+                    state,
+                    Tone::Ok,
+                    "已从列表删除该已吊销设备（凭证仍保持吊销拦截状态）",
+                );
+            }
         }
 
         if let Some(uid) = toggle_revoke {
             if let Some(pos) = conf.revoked_device_ids.iter().position(|id| *id == uid) {
                 conf.revoked_device_ids.remove(pos);
+                conf.hidden_revoked_device_ids.retain(|id| *id != uid);
             } else {
                 conf.revoked_device_ids.push(uid);
             }
@@ -825,6 +956,10 @@ fn revoke_card(
             if theme::button(ui, "加入吊销名单", Kind::Danger).clicked() {
                 match Uuid::parse_str(state.revoke_uuid_input.trim()) {
                     Ok(uid) => {
+                        if conf.hidden_revoked_device_ids.contains(&uid) {
+                            conf.hidden_revoked_device_ids.retain(|id| *id != uid);
+                            *changed = true;
+                        }
                         if !conf.revoked_device_ids.contains(&uid) {
                             conf.revoked_device_ids.push(uid);
                             *changed = true;

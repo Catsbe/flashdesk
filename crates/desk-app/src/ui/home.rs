@@ -19,6 +19,8 @@ pub enum HomeAction {
     ConnectDirect(String),
     GoToSettings,
     ConfigChanged,
+    CheckUpdate,
+    TriggerPeerUpdate(uuid::Uuid, String),
 }
 
 pub struct HomeState {
@@ -93,13 +95,26 @@ pub fn render_home(
     caps: &CodecCapabilities,
     monitors: &[MonitorTarget],
     sys: &SysStatus,
+    update_checking: bool,
+    effective_update: Option<&base_common::UpdateStatusSnapshot>,
 ) -> HomeAction {
     let mut action = HomeAction::None;
     let mut conf = cfg.lock().unwrap();
     let st = relay_status.lock().unwrap().clone();
 
     if conf.bundle.is_some() {
-        this_device_card(ui, state, cfg_path, &mut conf, caps, monitors, sys, &mut action);
+        this_device_card(
+            ui,
+            state,
+            cfg_path,
+            &mut conf,
+            caps,
+            monitors,
+            sys,
+            update_checking,
+            effective_update,
+            &mut action,
+        );
         theme::gap(ui);
         devices_card(ui, state, cfg_path, &conf, &st, relay_cmd_tx, &mut action);
         theme::gap(ui);
@@ -107,7 +122,18 @@ pub fn render_home(
     } else {
         onboarding_card(ui, state, cfg_path, &mut conf, &mut action);
         theme::gap(ui);
-        this_device_card(ui, state, cfg_path, &mut conf, caps, monitors, sys, &mut action);
+        this_device_card(
+            ui,
+            state,
+            cfg_path,
+            &mut conf,
+            caps,
+            monitors,
+            sys,
+            update_checking,
+            effective_update,
+            &mut action,
+        );
     }
 
     theme::toast_area(ui.ctx(), &mut state.toast);
@@ -233,6 +259,8 @@ fn this_device_card(
     caps: &CodecCapabilities,
     monitors: &[MonitorTarget],
     sys: &SysStatus,
+    update_checking: bool,
+    effective_update: Option<&base_common::UpdateStatusSnapshot>,
     action: &mut HomeAction,
 ) {
     theme::card(ui, |ui| {
@@ -284,7 +312,17 @@ fn this_device_card(
         theme::form_row_w(ui, "运行模式", 96.0, |ui| {
             // Button first (right-aligned) so a long status wraps instead of sliding under it.
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if sys.service != ServiceState::Running {
+                if sys.service == ServiceState::Stopped {
+                    if theme::small_button(ui, "启动系统服务", Kind::Primary)
+                        .on_hover_text("启动已安装的 FlashDeskService（支持锁屏、登录界面和 UAC）")
+                        .clicked()
+                    {
+                        match crate::service::install::start_service_for_ui() {
+                            Ok(()) => toast(ui, state, Tone::Ok, "已启动系统服务"),
+                            Err(e) => toast(ui, state, Tone::Danger, format!("启动失败：{e}")),
+                        }
+                    }
+                } else if sys.service != ServiceState::Running {
                     if theme::small_button(ui, "安装系统服务", Kind::Secondary)
                         .on_hover_text("需要管理员权限 (UAC)。安装后可远控锁屏、登录界面和 UAC 弹窗")
                         .clicked()
@@ -319,6 +357,35 @@ fn this_device_card(
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     theme::status_dot(ui, dot);
                     ui.add(egui::Label::new(RichText::new(mode_text).color(c::TEXT)).wrap());
+                });
+            });
+        });
+        theme::form_row_w(ui, "软件版本", 96.0, |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let busy = update_checking
+                    || effective_update.is_some_and(|u| {
+                        matches!(
+                            u.state,
+                            base_common::UpdatePhase::Checking | base_common::UpdatePhase::Downloading
+                        )
+                    });
+                ui.add_enabled_ui(!busy && conf.bundle.is_some(), |ui| {
+                    let btn_label = if busy { "检查中…" } else { "检查更新" };
+                    if theme::small_button(ui, btn_label, Kind::Ghost).clicked() {
+                        *action = HomeAction::CheckUpdate;
+                    }
+                });
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    theme::chip(
+                        ui,
+                        format!("v{}", crate::update::CORE_VERSION),
+                        c::TEXT_2,
+                        c::SURFACE_3,
+                    );
+                    if let Some(note) = effective_update.and_then(|u| u.message.as_deref()) {
+                        ui.add(egui::Label::new(theme::faint(note)).truncate())
+                            .on_hover_text(note);
+                    }
                 });
             });
         });
@@ -433,7 +500,16 @@ fn devices_card(
                             if theme::button(ui, "连接", Kind::Primary).clicked() {
                                 *action = HomeAction::ConnectRelay(dev.clone());
                             }
-                            ui.add_space(8.0);
+                            if theme::small_button(ui, "更新", Kind::Ghost)
+                                .on_hover_text("通知该设备立即检查并应用更新")
+                                .clicked()
+                            {
+                                *action = HomeAction::TriggerPeerUpdate(
+                                    dev.device_id,
+                                    dev.device_name.clone(),
+                                );
+                            }
+                            ui.add_space(4.0);
                             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                                 ui.spacing_mut().item_spacing.y = 2.0;
                                 ui.add(

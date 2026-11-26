@@ -35,6 +35,22 @@ pub struct PendingHostChannels {
     session_mutex: Arc<tokio::sync::Mutex<()>>,
     next_seq: AtomicU64,
     latest_seq: AtomicU64,
+    active_sessions_count: Arc<AtomicU32>,
+}
+
+struct SessionCounterGuard(Arc<AtomicU32>);
+
+impl SessionCounterGuard {
+    fn enter(counter: &Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for SessionCounterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct PendingSlot {
@@ -51,6 +67,17 @@ enum PendingDirectFile {
 impl PendingHostChannels {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_session_counter(counter: Arc<AtomicU32>) -> Self {
+        Self {
+            active_sessions_count: counter,
+            ..Self::default()
+        }
+    }
+
+    pub fn active_sessions_counter(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.active_sessions_count)
     }
 
     pub fn insert_channel(
@@ -177,6 +204,7 @@ pub async fn run_host_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
     video: NoiseStream<S>,
     opts: HostSessionOptions,
 ) -> Result<()> {
+    let _active_guard = SessionCounterGuard::enter(&opts.pending_channels.active_sessions_count);
     let session_seq = opts.pending_channels.claim_next_session();
     let _session_guard = opts.pending_channels.session_mutex.lock().await;
     if opts.pending_channels.is_superseded(session_seq) {
@@ -468,7 +496,9 @@ pub async fn run_host_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
                 let revoked = opts.revoked_ids.clone();
                 let pending = Arc::clone(&opts.pending_channels);
                 let out_tx = ctrl_out_tx.clone();
+                let file_counter = pending.active_sessions_counter();
                 tokio::spawn(async move {
+                    let _file_guard = SessionCounterGuard::enter(&file_counter);
                     let res = match relay_addr {
                         Some(addr) => async {
                             let tcp = connect_and_auth_relay(

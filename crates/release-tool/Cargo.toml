@@ -1,0 +1,23 @@
+[package]
+name = "release-tool"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "flashdesk-release"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base-common = { path = "../base-common", features = ["setup-payload"] }
+bincode = "1"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+hex = "0.4"
+protocol = { path = "../protocol" }
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }

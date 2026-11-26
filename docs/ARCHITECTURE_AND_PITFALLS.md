@@ -1,6 +1,7 @@
 # FlashDesk 架构设计、开发约束与踩坑交接文档
 
 > 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#19）。
+> **安装程序与自动更新架构详述见：[AUTO_UPDATE_AND_INSTALLER.md](AUTO_UPDATE_AND_INSTALLER.md)。**
 
 ---
 
@@ -9,9 +10,10 @@
 **FlashDesk** 是一套自建不限速、60fps 的 Windows 全栈 Rust 远程桌面软件，目标是在无第三方限速和账号体系的前提下替代向日葵，适合自用及多台常用电脑之间长期互连。
 
 ### 核心设计决策（已通过 `/grill-me` 对齐并落地）
-1. **技术栈**：Rust 工作区（`protocol` + `relay-server` + `desk-app`）+ 原生 GPU GUI（`eframe` 0.31 / `egui`，使用 **`glow` OpenGL 后端**）+ Windows SDK（`windows` 0.58：`DXGI` / `D3D11` / `GDI` / `Media Foundation` / Win32 Services & SetupAPI）。
-2. **All-in-One 单文件便携客户端（双形态合一）**：
-   - 默认双击即为无黑框便携绿色 GUI 客户端（配置与根私钥固定存放在 `%USERPROFILE%\.flashdesk\config.json` 与 `root.key`，避免切换 exe 路径丢失身份；系统服务严禁写入空配置）。
+1. **技术栈**：Rust 工作区（`protocol` + `relay-server` + `base-common` + `base-runtime` + `desk-app` + `release-tool` + `installer`）+ 原生 GPU GUI（`eframe` 0.31 / `egui`，使用 **`glow` OpenGL 后端**）+ Windows SDK（`windows` 0.58：`DXGI` / `D3D11` / `GDI` / `Media Foundation` / Win32 Services & SetupAPI）。
+2. **双形态部署（安装版 + 稳定基座热更新 / 兼容便携单文件）**：
+   - 提供纯 Rust 单文件图形化安装包 `FlashDesk-Setup.exe`（默认 `C:\Program Files\FlashDesk`，可自定义路径，绝不默认装 VDD），拆分轻量稳定基座（`bin\flashdesk-svc.exe` + `FlashDesk.exe` 启动器 + `bin\flashdesk-uninstall.exe`）与可热替换版本槽（`versions\<ver>\flashdesk-core.exe`），支持免 UAC 二进制差量补丁自动更新与 15 秒崩溃回滚（详见 [AUTO_UPDATE_AND_INSTALLER.md](AUTO_UPDATE_AND_INSTALLER.md)）。
+   - 同时保留单文件便携运行能力（配置与根私钥固定存放在 `%USERPROFILE%\.flashdesk\config.json` 与 `root.key`，避免切换路径丢失身份；系统服务严禁写入空配置）。
    - 支持一键提权（UAC）注册为 Windows `SYSTEM` 后台服务 `FlashDeskService`（Session 0 常驻守护 `--service` + 自动拉起 Session 1 交互桌面代理 `--agent`），支持锁屏（`Winlogon`）、UAC 管理员弹窗穿透及通过 `sas.dll` 发送真实 `Ctrl+Alt+Del`。
    - **服务与桌面 GUI 共存**：若本机系统服务已运行，桌面 GUI 仍可启动作为「主控发起端」，并通过 `PresenceClientMsg::UpdateInfo { accept_incoming: false }` 让中转服优先将入站控屏请求路由给 `accept_incoming: true` 的 SYSTEM 服务实例。
 3. **网络拓扑（多节点纯自建中转 + 局域网直连）**：
@@ -30,41 +32,56 @@
 ### 1. 文件树与职责划分
 
 ```text
-e:\Antigravity项目\自用远程软件\
+e:\Antigravity项目\flashdesk\
 ├── AGENTS.md                           # AI 接手速查红线（工具链、禁区、验证命令）
 ├── Cargo.toml                          # Workspace 根配置（release: opt-level=3, thin LTO, strip="symbols"）
 ├── .cargo\config.toml                  # target-dir 映射至 D:\Rust\target-flashdesk、GNU 链接及 Linux musl 交叉配置
-├── docs\ARCHITECTURE_AND_PITFALLS.md   # 本文档
+├── assets\
+│   └── flashdesk.ico                   # 多分辨率 Windows PE 图标资源（16–256 px）
+├── docs\
+│   ├── ARCHITECTURE_AND_PITFALLS.md    # 本文档
+│   ├── AUTO_UPDATE_AND_INSTALLER.md    # 安装包、轻量稳定基座与二进制差量自动更新设计
+│   └── TESTING.md                      # 自动化测试、--link-bench 与真机验收清单
 ├── deploy\
 │   ├── deploy-relay.sh                 # Ubuntu 一键部署脚本（LF 换行、BBR、32MB TCP 缓冲、CAP_NET_BIND_SERVICE、systemd）
 │   ├── flashdesk-relay-linux-x86_64    # Windows 交叉编译出的静态 Linux x86_64 中转端二进制
 │   └── README.md                       # Ubuntu 部署与运维命令说明
 ├── target\release\                     # 发布二进制落盘目录（不放临时文件）
-│   ├── flashdesk.exe                   # Windows 全功能单文件 GUI/服务一体化客户端
+│   ├── FlashDesk-Setup.exe             # Windows 图形化自解压安装程序（内嵌基座与核心载荷）
+│   ├── flashdesk.exe                   # Windows 核心业务程序（可独立便携运行，也是版本槽 flashdesk-core.exe 原型）
+│   ├── flashdesk-release.exe           # 补丁打包、根私钥签名、推送中转服与合成安装包 CLI
 │   ├── flashdesk-relay.exe             # Windows 中转端 / 密钥签发 CLI
 │   └── flashdesk-relay-linux-x86_64    # deploy\ 下静态 Linux 中转端同步副本
 └── crates\
-    ├── protocol\                       # 共享线协议、身份密码学与加密流传输
+    ├── base-common\                    # 基座与核心共享契约（state.json、心跳/更新状态、服务交互 ACL、图标 RGBA、看门狗，零网络/UI依赖）
+    ├── base-runtime\                   # 稳定基座可执行集（build.rs 嵌图标 + flashdesk-svc.exe、flashdesk-launcher.exe、flashdesk-uninstall.exe）
+    ├── installer\                      # 图形化安装程序（build.rs 嵌图标 + flashdesk-setup-stub.exe，eframe glow 后端）
+    ├── release-tool\                   # 发版工具 CLI（flashdesk-release.exe：pack / publish / build-setup）
+    ├── protocol\                       # 共享线协议、身份密码学、Noise、FLDP 差量补丁与更新清单验签
     │   └── src\
     │       ├── lib.rs                  # 公共导出与 ProtocolError
     │       ├── auth.rs                 # Ed25519 RootKeypair、DeviceCert、DeviceBundle (fdesk://v2/ / .fdesk)、RevocationCommand
     │       ├── framing.rs              # 4 字节大端长度前缀帧读写（MAX_FRAME_LEN）
     │       ├── noise.rs                # Noise_XX_25519_ChaChaPoly_BLAKE2s + Split Reader/Writer 分片大帧传输
-    │       ├── relay.rs                # RelayHello / RelayAuthRequest / ConnectionPurpose / Presence*（含 SyncRevocations / SetDisplayName）
+    │       ├── patch.rs                # 纯 Rust FLDP v1 二进制差量编码/应用与 deflate 全量压缩
+    │       ├── relay.rs                # RelayHello / RelayAuthRequest / ConnectionPurpose（含 UpdateChannel）/ Presence*
     │       ├── session.rs              # VideoCodec / MonitorInfo / InputEvent / ClipboardData / Vdd* / ControlMsg
-    │       └── transfer.rs             # FileEntry / FileMsg（目录浏览、Chunked 断点续传与 SHA-256 校验协议）
+    │       ├── transfer.rs             # FileEntry / FileMsg（目录浏览、Chunked 断点续传与 SHA-256 校验协议）
+    │       └── update.rs               # UpdateManifest、SignedUpdateManifest 与 UpdateChannel 线协议
     ├── relay-server\                   # 自建无状态感知纯 TCP 中转服务器（flashdesk-relay）
     │   ├── src\
     │   │   ├── main.rs                 # CLI: serve (--state-dir) / init-root / issue-bundle
     │   │   ├── config.rs               # RelayConfig (relay.toml 解析)
     │   │   ├── state.rs                # PeerEntry 路由表、PendingTunnel 配对、远程吊销验签踢人与持久化
-    │   │   └── server.rs               # 认证握手、Presence 心跳（25s 超时）、实时吊销同步、交互/文件分缓冲转发
-    │   └── tests\relay_e2e.rs          # 中转端 6 项端到端集成测试
-    └── desk-app\                       # Windows 桌面端 + 被控系统服务（flashdesk.exe）
-        ├── build.rs                    # Windows GNU 下静态链接 libstdc++.a / libwinpthread.a / libgcc*.a 组参数
+    │   │   ├── server.rs               # 认证握手、Presence 心跳（25s 超时）、UpdateChannel / 远程查更转发
+    │   │   └── updates.rs              # 根公钥验签落盘与断点分块分发（/var/lib/flashdesk/updates/）
+    │   └── tests\relay_e2e.rs          # 中转端端到端集成测试
+    └── desk-app\                       # Windows 桌面端 + 被控核心（flashdesk.exe / flashdesk-core.exe）
+        ├── build.rs                    # Windows GNU 下静态链接 libstdc++.a / libwinpthread.a / libgcc*.a + windres 嵌 PE 图标
         └── src\
-            ├── main.rs                 # CLI 路由、GUI 单例互斥、attach_parent_console、panic 弹窗/日志、--self-test
-            ├── config.rs               # AppConfig（固定 %USERPROFILE%\.flashdesk\config.json 与分离 root.key、已签发台账）
+            ├── main.rs                 # CLI 路由（含 --start-service / --stop-service / --wait-pid / --apply-staged-update）、GUI 单例、--self-test
+            ├── config.rs               # AppConfig（固定 %USERPROFILE%\.flashdesk\config.json 与分离 root.key、已签发台账与仅吊销可删）
+            ├── update\mod.rs           # 中转更新客户端、差量应用/全量回退、24h 定时与 IPC/远程触发
             ├── capture\                # 抓屏模块
             │   ├── monitors.rs         # DXGI 适配器与输出枚举 + GetDpiForMonitor (Per-Monitor DPI v2)
             │   └── dxgi.rs             # 三层单屏抓取（DuplicateOutput1 → DuplicateOutput → GdiSingleCapturer）与全景合成
@@ -83,7 +100,7 @@ e:\Antigravity项目\自用远程软件\
             ├── service\                # Windows SYSTEM 服务体系
             │   ├── desktop.rs          # OpenInputDesktop + SetThreadDesktop 切换至 Winlogon/UAC + sas.dll SendSAS
             │   ├── health.rs           # agent.status.json 心跳（pid/session/elevated/12s 新鲜度）+ GUI 接管判定唯一依据
-            │   ├── install.rs          # SCM 安装/查询/重启/卸载、SoftwareSASGeneration 注册表授权、C:\ProgramData\FlashDesk\config.json 同步
+            │   ├── install.rs          # SCM 安装/查询/启停/重启/卸载、IU 服务启停权限授权、SoftwareSASGeneration、ProgramData 同步
             │   └── win_service.rs      # Session 0 SCM 控制循环 + 启用 SeTcbPrivilege 后 WTSGetActiveConsoleSessionId 启动 Session 1 --agent
             ├── vdd\mod.rs              # Parsec VDD SetupAPI/IOCTL 增删与 100ms 心跳、Virtual-Display-Driver/OrayIddDriver 检测、ChangeDisplaySettingsExW
             ├── net\                    # 会话网络层
@@ -99,9 +116,9 @@ e:\Antigravity项目\自用远程软件\
                 ├── sysinfo.rs          # 服务/agent/虚拟屏/局域网 IP 状态后台轮询（2 s），UI 线程只读快照
                 ├── screen.rs           # 小屏适配：启动后按显示器工作区（扣除任务栏）缩小/居中窗口，最小尺寸随屏幕下调
                 ├── tray.rs             # Windows 系统托盘与 GUI 单例防多开：点 X 隐入托盘、重开或点击恢复窗口、托盘右键退出
-                ├── app.rs              # 顶部导航、.fdesk 拖拽导入、配置保存自动同步服务、热切中转节点
-                ├── home.rs             # 首次引导（填地址一键建根）、本机身份与服务同步提示、在线设备 + IP 直连
-                ├── settings.rs         # root.key 管理、二维码 & fdesk://v2/ 签发、已签发台账与一键远程吊销、节点/VDD/画质设置
+                ├── app.rs              # 顶部导航、.fdesk 拖拽导入、配置保存自动同步服务、热切中转节点、托盘退出自动停服务与重启保护
+                ├── home.rs             # 首次引导（填地址一键建根）、本机身份与服务启停/同步提示、在线设备 + IP 直连
+                ├── settings.rs         # root.key 管理、二维码 & fdesk://v2/ 签发、已签发台账与远程吊销/删除、节点/VDD/画质设置
                 └── remote_view.rs      # 远控画面、悬浮工具栏（画质/工具/默认收起的「详情」HUD）、热切控屏中转节点、双栏文件管理+拖拽上传、虚拟屏浮窗、断开对话框
 ```
 
@@ -150,7 +167,7 @@ $env:FLASHDESK_MINGW_DIR = "C:\Rust\mingw64"   # build.rs 的静态库搜索路�
 
 ### 2. 全量测试与双平台 Release 编译命令
 ```powershell
-# 1) 运行全部单元与集成测试（desk-app 25 + protocol 6 + relay_e2e 5 = 36 项，含 flow.rs 的 5M 链路仿真）
+# 1) 运行全部单元与集成测试（base-common 7 + desk-app 39 + protocol 14 + relay_e2e 7 + release-tool 2 = 69 项，含 flow.rs 的 5M 链路仿真）
 cargo test --workspace
 
 # 2) 编译 Windows Release（flashdesk.exe 与 flashdesk-relay.exe）
@@ -167,11 +184,11 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 ```
 
 ### 3. 每次发版前的必跑验收审计
-1. **PE 子系统与零 MinGW DLL 审计**（注意 `objdump` 需 `Push-Location` 后传相对路径）：
+1. **PE 子系统、`.rsrc` 图标节与零 MinGW DLL 审计**（注意 `objdump` 需 `Push-Location` 后传相对路径）：
    ```powershell
    Push-Location target\release
-   D:\Rust\mingw64\bin\objdump.exe -p .\flashdesk.exe | Select-String "Subsystem"    # 必须为 00000002 (Windows GUI)
-   D:\Rust\mingw64\bin\objdump.exe -p .\flashdesk.exe | Select-String "DLL Name"     # 严禁出现 libstdc++-6.dll / libwinpthread-1.dll / libgcc_s_seh-1.dll
+   D:\Rust\mingw64\bin\objdump.exe -p .\flashdesk.exe | Select-String "Subsystem|DLL Name"    # 必须为 00000002 (Windows GUI)，严禁出现 libstdc++-6.dll / libwinpthread-1.dll / libgcc_s_seh-1.dll
+   D:\Rust\mingw64\bin\objdump.exe -h .\flashdesk.exe | Select-String "\.rsrc"               # 确认非空 .rsrc 图标节存在
    D:\Rust\mingw64\bin\objdump.exe -p .\flashdesk-relay.exe | Select-String "DLL Name"
    Pop-Location
    ```

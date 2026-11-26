@@ -1,9 +1,11 @@
 pub mod auth;
 pub mod framing;
 pub mod noise;
+pub mod patch;
 pub mod relay;
 pub mod session;
 pub mod transfer;
+pub mod update;
 
 pub use auth::DeviceCert;
 pub use relay::ChannelKind;

@@ -1,5 +1,5 @@
 //! Machine status shown on the home / settings pages: SYSTEM service state, desktop agent
-//! health, virtual display driver and LAN address.
+//! health, virtual display driver, LAN address, and install/update state.
 //!
 //! These queries hit the service control manager, SetupAPI, the network stack and the
 //! filesystem. They used to run on *every* UI repaint (dozens of times per second while the
@@ -10,6 +10,11 @@ use crate::net::local_lan_ip;
 use crate::service::health::agent_healthy;
 use crate::service::install::{query_service_state, ServiceState};
 use crate::vdd::detect_vdd_status;
+use base_common::{
+    read_json_opt, InstallLayout, InstallState, UpdateStatusSnapshot, STATE_FILE_NAME,
+    UPDATE_STATUS_PATH,
+};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,6 +25,9 @@ pub struct SysStatus {
     pub service_config_synced: bool,
     pub vdd_details: String,
     pub lan_ip: String,
+    pub install_layout: InstallLayout,
+    pub install_state: Option<InstallState>,
+    pub update_status: Option<UpdateStatusSnapshot>,
 }
 
 pub type SharedSysStatus = Arc<Mutex<SysStatus>>;
@@ -29,12 +37,20 @@ fn probe(cfg: &Arc<Mutex<AppConfig>>) -> SysStatus {
     let cfg_snap = cfg.lock().unwrap().clone();
     let service_config_synced =
         service == ServiceState::Running && cfg_snap.service_config_matches_disk();
+    let install_layout = crate::update::current_install_layout();
+    let install_state = install_layout
+        .install_dir()
+        .and_then(|d| read_json_opt::<InstallState>(&d.join(STATE_FILE_NAME)));
+    let update_status = read_json_opt::<UpdateStatusSnapshot>(Path::new(UPDATE_STATUS_PATH));
     SysStatus {
         service,
         agent_ok: agent_healthy(),
         service_config_synced,
         vdd_details: detect_vdd_status().details,
         lan_ip: local_lan_ip(),
+        install_layout,
+        install_state,
+        update_status,
     }
 }
 

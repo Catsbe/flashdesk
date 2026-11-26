@@ -77,9 +77,10 @@ pub fn spawn_direct_listener(
     cfg: Arc<Mutex<AppConfig>>,
     caps: CodecCapabilities,
     agent_mode: bool,
+    active_sessions: Arc<std::sync::atomic::AtomicU32>,
 ) {
     tokio::spawn(async move {
-        let pending = Arc::new(PendingHostChannels::new());
+        let pending = Arc::new(PendingHostChannels::with_session_counter(active_sessions));
         let mut bind_warned = false;
 
         // Bind supervisor: the port must always be owned by exactly one live host.

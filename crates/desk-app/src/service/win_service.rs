@@ -254,9 +254,7 @@ fn supervisor_loop(exe_path: &Path, cfg_path: &Path) {
         // Backoff: spawn failures grow the poll interval up to ~5s; agent crash-loops up to ~10s.
         let failure_delay = 500u64 * (spawn_failures.min(9) as u64);
         let crash_delay = 2000u64 * (crash_count.min(5) as u64);
-        std::thread::sleep(std::time::Duration::from_millis(
-            500 + failure_delay.min(4500) + crash_delay.min(10_000),
-        ));
+        sleep_interruptible(500 + failure_delay.min(4500) + crash_delay.min(10_000));
     }
 
     if let Some(h) = child_handle.take() {
@@ -265,6 +263,16 @@ fn supervisor_loop(exe_path: &Path, cfg_path: &Path) {
             let _ = WaitForSingleObject(h, 2000);
             let _ = CloseHandle(h);
         }
+    }
+    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+}
+
+fn sleep_interruptible(total_ms: u64) {
+    let mut elapsed = 0u64;
+    while elapsed < total_ms && !STOP_FLAG.load(Ordering::SeqCst) {
+        let step = (total_ms - elapsed).min(100);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        elapsed += step;
     }
 }
 

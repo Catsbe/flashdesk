@@ -8,21 +8,38 @@ use crate::net::viewer_session::{
     ViewerSessionHandle,
 };
 use crate::net::RelayStatus;
+use crate::service::install::ServiceState;
 use crate::ui::home::{render_home, HomeAction, HomeState};
 use crate::ui::remote_view::{render_remote_view, RemoteViewAction, RemoteViewState};
 use crate::ui::screen;
 use crate::ui::settings::{render_settings, SettingsState};
-use crate::ui::sysinfo::{spawn_status_poller, SharedSysStatus};
+use crate::ui::sysinfo::{spawn_status_poller, SharedSysStatus, SysStatus};
 use crate::ui::theme::{self, c};
 use crate::ui::tray::{self, TrayHandle};
+use crate::update::{CheckOutcome, StagedArtifact, CORE_VERSION};
+use base_common::{is_newer_version, InstallLayout, UpdatePhase, UpdateStatusSnapshot};
 use eframe::egui::{
     self, Align, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, StrokeKind,
 };
 use protocol::auth::RelayNodeConfig;
 use protocol::relay::OnlineDevice;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+
+enum GuiCheckEvent {
+    Progress(UpdateStatusSnapshot),
+    Finished(anyhow::Result<CheckOutcome>),
+}
+
+#[derive(Default)]
+struct GuiUpdateState {
+    checking: bool,
+    manual_snap: Option<UpdateStatusSnapshot>,
+    staged_for_gui: Option<StagedArtifact>,
+    check_rx: Option<std::sync::mpsc::Receiver<GuiCheckEvent>>,
+}
 
 #[derive(PartialEq, Eq)]
 enum ActiveTab {
@@ -55,6 +72,9 @@ pub struct FlashDeskApp {
     window_fitted: bool,
     tray: TrayHandle,
     main_hwnd_resolved: bool,
+    gui_update: GuiUpdateState,
+    remote_check_rx: mpsc::UnboundedReceiver<()>,
+    restarting_for_update: bool,
 }
 
 impl FlashDeskApp {
@@ -75,6 +95,8 @@ impl FlashDeskApp {
         });
         let sys = spawn_status_poller(Arc::clone(&cfg_arc), Arc::clone(&repaint));
 
+        let active_sessions = Arc::new(AtomicU32::new(0));
+        let (remote_check_tx, remote_check_rx) = mpsc::unbounded_channel();
         let relay_cmd_tx = spawn_relay_manager(
             cfg,
             caps.clone(),
@@ -82,13 +104,25 @@ impl FlashDeskApp {
             false,
             Arc::clone(&relay_status),
             repaint,
+            Arc::clone(&active_sessions),
+            Some(remote_check_tx),
         );
         // Always run the LAN direct listener: it self-defers to a healthy SYSTEM agent and
         // re-binds automatically when the agent dies, so LAN direct never silently disappears.
-        spawn_direct_listener(Arc::clone(&cfg_arc), caps.clone(), false);
+        spawn_direct_listener(Arc::clone(&cfg_arc), caps.clone(), false, active_sessions);
 
         let main_hwnd = tray::find_main_window_hwnd();
         let tray = TrayHandle::spawn(main_hwnd, cc.egui_ctx.clone());
+
+        // Resume an already-installed service that was stopped when the user exited from the tray,
+        // using non-elevated service control so startup never triggers a UAC prompt.
+        let _ = std::thread::Builder::new()
+            .name("flashdesk-svc-autostart".into())
+            .spawn(|| {
+                if crate::service::install::query_service_state() == ServiceState::Stopped {
+                    let _ = crate::service::install::try_start_service_direct();
+                }
+            });
 
         Self {
             cfg_path,
@@ -105,6 +139,9 @@ impl FlashDeskApp {
             window_fitted: false,
             tray,
             main_hwnd_resolved: main_hwnd != 0,
+            gui_update: GuiUpdateState::default(),
+            remote_check_rx,
+            restarting_for_update: false,
         }
     }
 
@@ -223,6 +260,238 @@ impl FlashDeskApp {
                 },
             );
         }
+    }
+
+    fn push_toast(&mut self, ctx: &egui::Context, tone: theme::Tone, msg: impl Into<String>) {
+        let t = theme::Toast::new(ctx, tone, msg);
+        self.home_state.toast = Some(t.clone());
+        self.settings_state.toast = Some(t);
+    }
+
+    fn effective_update_snapshot<'a>(&'a self, sys: &'a SysStatus) -> Option<&'a UpdateStatusSnapshot> {
+        match (&self.gui_update.manual_snap, &sys.update_status) {
+            (Some(a), Some(b)) => Some(if a.updated_at >= b.updated_at { a } else { b }),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
+    fn poll_gui_update_events(&mut self, ctx: &egui::Context) {
+        let mut finished = None;
+        if let Some(rx) = &self.gui_update.check_rx {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    GuiCheckEvent::Progress(snap) => {
+                        self.gui_update.manual_snap = Some(snap);
+                    }
+                    GuiCheckEvent::Finished(res) => {
+                        finished = Some(res);
+                    }
+                }
+            }
+        }
+        if let Some(res) = finished {
+            self.gui_update.checking = false;
+            self.gui_update.check_rx = None;
+            match res {
+                Ok(out) => {
+                    let msg = out.snapshot.message.clone();
+                    let tone = match out.snapshot.state {
+                        UpdatePhase::Error | UpdatePhase::NeedsBaseUpgrade { .. } => {
+                            theme::Tone::Warn
+                        }
+                        UpdatePhase::StagedPendingIdle | UpdatePhase::SwitchedRestartGui => {
+                            theme::Tone::Ok
+                        }
+                        _ => theme::Tone::Info,
+                    };
+                    self.gui_update.manual_snap = Some(out.snapshot);
+                    if let Some(art) = out.staged_for_gui {
+                        self.gui_update.staged_for_gui = Some(art);
+                    }
+                    if let Some(m) = msg {
+                        self.push_toast(ctx, tone, m);
+                    }
+                }
+                Err(e) => {
+                    self.push_toast(ctx, theme::Tone::Danger, format!("检查更新失败：{e:#}"));
+                }
+            }
+        }
+    }
+
+    fn trigger_check_update(&mut self, ctx: &egui::Context, sys: &SysStatus) {
+        if sys.service == ServiceState::Running && sys.agent_ok {
+            if crate::update::write_ipc_check_now().is_ok() {
+                self.push_toast(ctx, theme::Tone::Info, "已通知后台服务立即检查更新…");
+                return;
+            }
+        }
+        if self.gui_update.checking {
+            return;
+        }
+        let cfg_snap = self.cfg.lock().unwrap().clone();
+        if cfg_snap.bundle.is_none() {
+            self.push_toast(ctx, theme::Tone::Warn, "请先绑定设备身份后再检查更新");
+            return;
+        }
+        self.gui_update.checking = true;
+        let layout = sys.install_layout.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.gui_update.check_rx = Some(rx);
+        let egui_ctx = ctx.clone();
+
+        tokio::spawn(async move {
+            let progress_tx = tx.clone();
+            let progress_ctx = egui_ctx.clone();
+            let res = crate::update::check_and_stage_update(&cfg_snap, &layout, false, move |snap| {
+                let _ = progress_tx.send(GuiCheckEvent::Progress(snap.clone()));
+                progress_ctx.request_repaint();
+            })
+            .await;
+            let _ = tx.send(GuiCheckEvent::Finished(res));
+            egui_ctx.request_repaint();
+        });
+    }
+
+    fn restart_to_new_version(&mut self, ctx: &egui::Context, install_dir: &Path) {
+        if let Some(art) = self.gui_update.staged_for_gui.clone() {
+            if let Err(e) = crate::update::apply_staged_for_gui(install_dir, &art) {
+                self.push_toast(ctx, theme::Tone::Danger, format!("应用更新失败：{e:#}"));
+                return;
+            }
+            self.gui_update.staged_for_gui = None;
+        }
+        match crate::update::restart_via_launcher(install_dir) {
+            Ok(()) => {
+                self.restarting_for_update = true;
+                if let Some((session, _)) = self.active_session.take() {
+                    session.send(ViewerCommand::Disconnect);
+                }
+                self.tray.shutdown();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.push_toast(ctx, theme::Tone::Danger, format!("重启失败：{e:#}"));
+            }
+        }
+    }
+
+    fn render_update_banner(&mut self, ctx: &egui::Context, sys: &SysStatus) {
+        let managed_dir = match &sys.install_layout {
+            InstallLayout::ManagedCore { install_dir, .. } => Some(install_dir.clone()),
+            _ => None,
+        };
+
+        let ready_version = if managed_dir.is_some() {
+            let from_state = sys
+                .install_state
+                .as_ref()
+                .filter(|st| {
+                    st.candidate.is_none() && is_newer_version(&st.active_version, CORE_VERSION)
+                })
+                .map(|st| st.active_version.clone());
+            from_state.or_else(|| {
+                self.gui_update
+                    .staged_for_gui
+                    .as_ref()
+                    .map(|a| a.version.clone())
+            })
+        } else {
+            None
+        };
+
+        let ready_notes = self
+            .gui_update
+            .staged_for_gui
+            .as_ref()
+            .map(|a| a.notes.clone())
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                sys.update_status
+                    .as_ref()
+                    .and_then(|u| u.notes.clone())
+                    .filter(|s| !s.trim().is_empty())
+            });
+
+        let eff = self.effective_update_snapshot(sys).cloned();
+
+        enum BannerKind {
+            RestartReady(String, PathBuf, Option<String>),
+            Warn(String),
+            Progress(String),
+        }
+
+        let banner = if let (Some(ver), Some(dir)) = (ready_version, managed_dir) {
+            Some(BannerKind::RestartReady(ver, dir, ready_notes))
+        } else if let Some(snap) = eff {
+            match &snap.state {
+                UpdatePhase::NeedsBaseUpgrade { min_base_version } => Some(BannerKind::Warn(format!(
+                    "发现新版本需要基座 >= v{min_base_version}，请运行新版 FlashDesk-Setup.exe 覆盖安装"
+                ))),
+                UpdatePhase::RolledBack { bad_version } => Some(BannerKind::Warn(format!(
+                    "新版本 v{bad_version} 启动异常，基座已自动回滚至稳定版本"
+                ))),
+                UpdatePhase::Downloading => {
+                    let pct = snap.progress_pct.unwrap_or(0);
+                    Some(BannerKind::Progress(format!(
+                        "正在下载更新 v{} ({pct}%)…",
+                        snap.available_version.as_deref().unwrap_or("")
+                    )))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let Some(kind) = banner else {
+            return;
+        };
+
+        let (fill, stroke) = match &kind {
+            BannerKind::RestartReady(..) => (c::ACCENT_SOFT, c::ACCENT),
+            BannerKind::Warn(_) => (egui::Color32::from_rgb(56, 42, 20), c::WARN),
+            BannerKind::Progress(_) => (c::SURFACE_2, c::BORDER_STRONG),
+        };
+
+        egui::TopBottomPanel::top("update_banner")
+            .frame(
+                Frame::new()
+                    .fill(fill)
+                    .stroke(Stroke::new(1.0_f32, stroke))
+                    .inner_margin(Margin::symmetric(20, 7)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let (text, hover) = match &kind {
+                            BannerKind::RestartReady(ver, dir, notes) => {
+                                if theme::small_button(ui, "立即重启更新", theme::Kind::Primary)
+                                    .clicked()
+                                {
+                                    self.restart_to_new_version(ctx, dir);
+                                }
+                                (
+                                    format!("新版本 v{ver} 已就绪，重启后立即生效"),
+                                    notes.clone(),
+                                )
+                            }
+                            BannerKind::Warn(msg) | BannerKind::Progress(msg) => {
+                                (msg.clone(), None)
+                            }
+                        };
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            let resp =
+                                ui.add(egui::Label::new(RichText::new(text).color(c::TEXT)).wrap());
+                            if let Some(n) = hover {
+                                resp.on_hover_text(format!("更新说明：{n}"));
+                            }
+                        });
+                    });
+                });
+            });
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
@@ -376,7 +645,16 @@ impl eframe::App for FlashDeskApp {
             return;
         }
 
+        let sys = self.sys.lock().unwrap().clone();
+        self.poll_gui_update_events(ctx);
+        while self.remote_check_rx.try_recv().is_ok() {
+            if !sys.agent_ok {
+                self.trigger_check_update(ctx, &sys);
+            }
+        }
+
         self.top_bar(ctx);
+        self.render_update_banner(ctx, &sys);
 
         // Support dragging a `.fdesk` / `.json` bundle directly onto the main window to bind.
         let (hovered_files, dropped_files) = ctx.input(|i| {
@@ -441,9 +719,11 @@ impl eframe::App for FlashDeskApp {
             }
         }
 
-        let sys = self.sys.lock().unwrap().clone();
         let mut home_action = HomeAction::None;
         let mut settings_changed = false;
+        let mut settings_check_update = false;
+        let eff_snap = self.effective_update_snapshot(&sys).cloned();
+        let update_checking = self.gui_update.checking;
         egui::CentralPanel::default()
             .frame(Frame::new().fill(c::BG))
             .show(ctx, |ui| {
@@ -462,10 +742,12 @@ impl eframe::App for FlashDeskApp {
                                     &self.caps,
                                     &self.monitors,
                                     &sys,
+                                    update_checking,
+                                    eff_snap.as_ref(),
                                 );
                             }
                             ActiveTab::Settings => {
-                                settings_changed = render_settings(
+                                let out = render_settings(
                                     ui,
                                     &mut self.settings_state,
                                     &self.cfg_path,
@@ -473,7 +755,11 @@ impl eframe::App for FlashDeskApp {
                                     &self.relay_status,
                                     &self.relay_cmd_tx,
                                     &sys,
+                                    update_checking,
+                                    eff_snap.as_ref(),
                                 );
+                                settings_changed = out.config_changed;
+                                settings_check_update = out.check_update;
                             }
                         });
                     });
@@ -482,11 +768,25 @@ impl eframe::App for FlashDeskApp {
         if settings_changed {
             self.save_and_reload_relay();
         }
+        if settings_check_update {
+            self.trigger_check_update(ctx, &sys);
+        }
         match home_action {
             HomeAction::ConfigChanged => self.save_and_reload_relay(),
             HomeAction::GoToSettings => self.active_tab = ActiveTab::Settings,
             HomeAction::ConnectRelay(dev) => self.connect_relay_device(ctx, dev),
             HomeAction::ConnectDirect(addr) => self.start_session(ctx, ConnectTarget::Direct(addr)),
+            HomeAction::CheckUpdate => self.trigger_check_update(ctx, &sys),
+            HomeAction::TriggerPeerUpdate(dev_id, dev_name) => {
+                let _ = self
+                    .relay_cmd_tx
+                    .send(RelayCommand::RequestPeerUpdateCheck(dev_id));
+                self.push_toast(
+                    ctx,
+                    theme::Tone::Info,
+                    format!("已通知 {dev_name} 立即检查更新"),
+                );
+            }
             HomeAction::None => {}
         }
     }
@@ -496,5 +796,8 @@ impl eframe::App for FlashDeskApp {
             session.send(ViewerCommand::Disconnect);
         }
         self.tray.shutdown();
+        if !self.restarting_for_update {
+            crate::service::install::stop_service_for_app_exit();
+        }
     }
 }

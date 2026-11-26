@@ -3,7 +3,10 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, HWND};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_CANNOT_ACCEPT_CTRL,
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_NOT_ACTIVE, HWND,
+};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_WRITE, REG_DWORD,
     REG_OPTION_NON_VOLATILE,
@@ -15,8 +18,8 @@ use windows::Win32::System::Services::{
     SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
     SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONTROL_STOP, SERVICE_ERROR_NORMAL,
     SERVICE_FAILURE_ACTIONSW, SERVICE_NO_CHANGE, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-    SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
-    SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_START, SERVICE_START_TYPE, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+    SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -176,11 +179,21 @@ pub fn install_and_start_service(source_cfg: Option<&Path>) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("无法获取当前 exe 路径")?;
-    let bin_cmd = format!(
-        "\"{}\" --service --config \"{}\"",
-        exe.display(),
-        SHARED_CONFIG_PATH
-    );
+    let bin_cmd = match base_common::detect_install_layout(&exe) {
+        base_common::InstallLayout::ManagedCore { install_dir, .. }
+        | base_common::InstallLayout::ManagedRoot { install_dir } => {
+            let svc_exe = install_dir.join("bin").join(base_common::SVC_EXE_NAME);
+            let _ = base_common::ensure_ipc_dir_writable(Path::new(base_common::UPDATE_IPC_DIR));
+            if svc_exe.is_file() {
+                format!("\"{}\" --config \"{}\"", svc_exe.display(), SHARED_CONFIG_PATH)
+            } else {
+                format!("\"{}\" --service --config \"{}\"", exe.display(), SHARED_CONFIG_PATH)
+            }
+        }
+        base_common::InstallLayout::Portable => {
+            format!("\"{}\" --service --config \"{}\"", exe.display(), SHARED_CONFIG_PATH)
+        }
+    };
     let bin_w = to_wide_null(OsStr::new(&bin_cmd));
     let svc_name_w = to_wide_null(OsStr::new(SERVICE_NAME));
     let disp_name_w = to_wide_null(OsStr::new(SERVICE_DISPLAY_NAME));
@@ -257,6 +270,10 @@ pub fn install_and_start_service(source_cfg: Option<&Path>) -> Result<()> {
         let _ = SERVICE_NO_CHANGE;
         let _ = SERVICE_START_TYPE(0);
 
+        if let Err(e) = base_common::grant_interactive_user_service_control(SERVICE_NAME) {
+            tracing::warn!("failed to grant interactive user service control: {e:#}");
+        }
+
         if let Err(e) = StartServiceW(svc, None) {
             if e.code() != ERROR_SERVICE_ALREADY_RUNNING.to_hresult() {
                 return Err(e.into());
@@ -265,6 +282,217 @@ pub fn install_and_start_service(source_cfg: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn wait_for_service_stopped(svc: SC_HANDLE, max_wait: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + max_wait;
+    loop {
+        let mut buf = [0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
+        let mut needed = 0u32;
+        if unsafe { QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, Some(&mut buf), &mut needed) }
+            .is_ok()
+        {
+            let st = unsafe { &*(buf.as_ptr() as *const SERVICE_STATUS_PROCESS) };
+            if st.dwCurrentState == SERVICE_STOPPED {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectServiceControl {
+    Ok,
+    AlreadyInState,
+    NotInstalled,
+    AccessDenied,
+    Failed(String),
+}
+
+/// Attempts to stop `FlashDeskService` without UAC elevation. Succeeds directly once the
+/// service DACL grants `IU` start/stop rights.
+pub fn try_stop_service_direct() -> DirectServiceControl {
+    unsafe {
+        let scm = match OpenSCManagerW(None, None, SC_MANAGER_CONNECT) {
+            Ok(h) => h,
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                return DirectServiceControl::AccessDenied;
+            }
+            Err(e) => return DirectServiceControl::Failed(e.to_string()),
+        };
+        let _scm_guard = ScHandleGuard(scm);
+        let svc_name_w = to_wide_null(OsStr::new(SERVICE_NAME));
+        let svc = match OpenServiceW(
+            scm,
+            PCWSTR(svc_name_w.as_ptr()),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        ) {
+            Ok(h) => h,
+            Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => {
+                return DirectServiceControl::NotInstalled;
+            }
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                return DirectServiceControl::AccessDenied;
+            }
+            Err(e) => return DirectServiceControl::Failed(e.to_string()),
+        };
+        let _svc_guard = ScHandleGuard(svc);
+
+        let mut status = SERVICE_STATUS::default();
+        match ControlService(svc, SERVICE_CONTROL_STOP, &mut status) {
+            Ok(()) => {
+                let _ = wait_for_service_stopped(svc, std::time::Duration::from_secs(5));
+                let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+                DirectServiceControl::Ok
+            }
+            Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => {
+                let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+                DirectServiceControl::AlreadyInState
+            }
+            Err(e) if e.code() == ERROR_SERVICE_CANNOT_ACCEPT_CTRL.to_hresult() => {
+                if wait_for_service_stopped(svc, std::time::Duration::from_secs(5)) {
+                    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+                }
+                DirectServiceControl::Ok
+            }
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                DirectServiceControl::AccessDenied
+            }
+            Err(e) => DirectServiceControl::Failed(e.to_string()),
+        }
+    }
+}
+
+/// Attempts to start `FlashDeskService` without UAC elevation. Succeeds directly once the
+/// service DACL grants `IU` start/stop rights.
+pub fn try_start_service_direct() -> DirectServiceControl {
+    unsafe {
+        let scm = match OpenSCManagerW(None, None, SC_MANAGER_CONNECT) {
+            Ok(h) => h,
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                return DirectServiceControl::AccessDenied;
+            }
+            Err(e) => return DirectServiceControl::Failed(e.to_string()),
+        };
+        let _scm_guard = ScHandleGuard(scm);
+        let svc_name_w = to_wide_null(OsStr::new(SERVICE_NAME));
+        let svc = match OpenServiceW(
+            scm,
+            PCWSTR(svc_name_w.as_ptr()),
+            SERVICE_START | SERVICE_QUERY_STATUS,
+        ) {
+            Ok(h) => h,
+            Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => {
+                return DirectServiceControl::NotInstalled;
+            }
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                return DirectServiceControl::AccessDenied;
+            }
+            Err(e) => return DirectServiceControl::Failed(e.to_string()),
+        };
+        let _svc_guard = ScHandleGuard(svc);
+
+        match StartServiceW(svc, None) {
+            Ok(()) => DirectServiceControl::Ok,
+            Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => {
+                DirectServiceControl::AlreadyInState
+            }
+            Err(e) if e.code() == ERROR_ACCESS_DENIED.to_hresult() => {
+                DirectServiceControl::AccessDenied
+            }
+            Err(e) => DirectServiceControl::Failed(e.to_string()),
+        }
+    }
+}
+
+pub fn stop_service_elevated() -> Result<()> {
+    unsafe {
+        let scm = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+            .context("OpenSCManagerW 失败，请以管理员权限运行")?;
+        let _scm_guard = ScHandleGuard(scm);
+        let svc_name_w = to_wide_null(OsStr::new(SERVICE_NAME));
+        let svc = match OpenServiceW(scm, PCWSTR(svc_name_w.as_ptr()), SERVICE_ALL_ACCESS) {
+            Ok(s) => s,
+            Err(e) if e.code() == ERROR_SERVICE_DOES_NOT_EXIST.to_hresult() => return Ok(()),
+            Err(e) => return Err(e).context("打开 FlashDeskService 失败"),
+        };
+        let _svc_guard = ScHandleGuard(svc);
+
+        let _ = base_common::grant_interactive_user_service_control(SERVICE_NAME);
+
+        let mut status = SERVICE_STATUS::default();
+        if let Err(e) = ControlService(svc, SERVICE_CONTROL_STOP, &mut status) {
+            if e.code() != ERROR_SERVICE_NOT_ACTIVE.to_hresult()
+                && e.code() != ERROR_SERVICE_CANNOT_ACCEPT_CTRL.to_hresult()
+            {
+                return Err(e).context("停止 FlashDeskService 失败");
+            }
+        }
+        let _ = wait_for_service_stopped(svc, std::time::Duration::from_secs(10));
+    }
+    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
+    Ok(())
+}
+
+pub fn start_service_elevated() -> Result<()> {
+    unsafe {
+        let scm = OpenSCManagerW(None, None, SC_MANAGER_ALL_ACCESS)
+            .context("OpenSCManagerW 失败，请以管理员权限运行")?;
+        let _scm_guard = ScHandleGuard(scm);
+        let svc_name_w = to_wide_null(OsStr::new(SERVICE_NAME));
+        let svc = OpenServiceW(scm, PCWSTR(svc_name_w.as_ptr()), SERVICE_ALL_ACCESS)
+            .context("打开 FlashDeskService 失败（服务未安装？）")?;
+        let _svc_guard = ScHandleGuard(svc);
+
+        let _ = base_common::grant_interactive_user_service_control(SERVICE_NAME);
+
+        if let Err(e) = StartServiceW(svc, None) {
+            if e.code() != ERROR_SERVICE_ALREADY_RUNNING.to_hresult() {
+                return Err(e).context("启动 FlashDeskService 失败");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stops `FlashDeskService` when the user exits FlashDesk from the taskbar tray.
+/// Falls back to an elevated UAC helper once if an older installation lacks `IU` stop rights.
+pub fn stop_service_for_app_exit() {
+    if matches!(
+        query_service_state(),
+        ServiceState::NotInstalled | ServiceState::Stopped
+    ) {
+        return;
+    }
+    match try_stop_service_direct() {
+        DirectServiceControl::Ok
+        | DirectServiceControl::AlreadyInState
+        | DirectServiceControl::NotInstalled => {
+            tracing::info!("FlashDeskService stopped on app exit");
+        }
+        DirectServiceControl::AccessDenied => {
+            tracing::info!("FlashDeskService stop requires elevation; requesting UAC");
+            let _ = launch_elevated_service_cmd("--stop-service");
+        }
+        DirectServiceControl::Failed(msg) => {
+            tracing::warn!("failed to stop FlashDeskService on app exit: {msg}");
+        }
+    }
+}
+
+/// Starts an already-installed `FlashDeskService` from the GUI, falling back to UAC once if
+/// needed.
+pub fn start_service_for_ui() -> Result<()> {
+    match try_start_service_direct() {
+        DirectServiceControl::Ok | DirectServiceControl::AlreadyInState => Ok(()),
+        DirectServiceControl::AccessDenied => launch_elevated_service_cmd("--start-service"),
+        DirectServiceControl::NotInstalled => anyhow::bail!("系统服务尚未安装"),
+        DirectServiceControl::Failed(msg) => anyhow::bail!("启动系统服务失败: {msg}"),
+    }
 }
 
 /// Stops (if running) and starts the service again, e.g. after replacing flashdesk.exe or when the
@@ -281,18 +509,9 @@ pub fn restart_service() -> Result<()> {
 
         let mut status = SERVICE_STATUS::default();
         let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
-        for _ in 0..50 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let mut buf = [0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
-            let mut needed = 0u32;
-            if QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, Some(&mut buf), &mut needed)
-                .is_ok()
-            {
-                let st = &*(buf.as_ptr() as *const SERVICE_STATUS_PROCESS);
-                if st.dwCurrentState == SERVICE_STOPPED {
-                    break;
-                }
-            }
+        let _ = wait_for_service_stopped(svc, std::time::Duration::from_secs(10));
+        if let Err(e) = base_common::grant_interactive_user_service_control(SERVICE_NAME) {
+            tracing::warn!("failed to grant interactive user service control: {e:#}");
         }
         StartServiceW(svc, None).context("重新启动 FlashDeskService 失败")?;
     }
@@ -311,22 +530,11 @@ pub fn stop_and_uninstall_service() -> Result<()> {
 
         let mut status = SERVICE_STATUS::default();
         let _ = ControlService(svc, SERVICE_CONTROL_STOP, &mut status);
-        for _ in 0..25 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            let mut buf = [0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
-            let mut needed = 0u32;
-            if QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO, Some(&mut buf), &mut needed)
-                .is_ok()
-            {
-                let st = &*(buf.as_ptr() as *const SERVICE_STATUS_PROCESS);
-                if st.dwCurrentState == SERVICE_STOPPED {
-                    break;
-                }
-            }
-        }
+        let _ = wait_for_service_stopped(svc, std::time::Duration::from_secs(5));
 
         DeleteService(svc).context("DeleteService 失败")?;
     }
+    let _ = std::fs::remove_file(base_common::AGENT_STATUS_PATH);
     Ok(())
 }
 

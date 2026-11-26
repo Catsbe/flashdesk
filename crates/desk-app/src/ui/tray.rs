@@ -115,59 +115,7 @@ fn activate_existing_gui_instance() {
 
 /// Generates a 32x32 RGBA FlashDesk icon (dark rounded badge + teal lightning bolt).
 pub fn build_tray_icon_rgba() -> Vec<u8> {
-    const SIZE: usize = 32;
-    let mut rgba = vec![0u8; SIZE * SIZE * 4];
-
-    // Two triangles forming a clean lightning bolt in normalized [0..32) coordinates.
-    let bolt_top: [(f32, f32); 3] = [(17.8, 5.0), (10.2, 17.5), (16.4, 17.5)];
-    let bolt_bot: [(f32, f32); 3] = [(14.2, 27.0), (21.8, 14.5), (15.6, 14.5)];
-
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-
-            let dist = rounded_box_sdf(px - 16.0, py - 16.0, 13.5, 13.5, 6.0);
-            if dist > 0.75 {
-                continue;
-            }
-            let badge_alpha = ((0.75 - dist) / 1.2).clamp(0.0, 1.0);
-
-            let in_bolt = point_in_tri(px, py, bolt_top) || point_in_tri(px, py, bolt_bot);
-            let (r, g, b) = if in_bolt {
-                (70u8, 224u8, 194u8)
-            } else if dist > -1.3 {
-                (45u8, 200u8, 170u8)
-            } else {
-                (18u8, 28u8, 36u8)
-            };
-
-            let off = (y * SIZE + x) * 4;
-            rgba[off] = r;
-            rgba[off + 1] = g;
-            rgba[off + 2] = b;
-            rgba[off + 3] = (badge_alpha * 255.0).round() as u8;
-        }
-    }
-    rgba
-}
-
-fn rounded_box_sdf(px: f32, py: f32, half_w: f32, half_h: f32, radius: f32) -> f32 {
-    let qx = px.abs() - half_w + radius;
-    let qy = py.abs() - half_h + radius;
-    let out = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-    let inside = qx.max(qy).min(0.0);
-    out + inside - radius
-}
-
-fn point_in_tri(px: f32, py: f32, tri: [(f32, f32); 3]) -> bool {
-    let sign = |a: (f32, f32), b: (f32, f32)| (px - b.0) * (a.1 - b.1) - (a.0 - b.0) * (py - b.1);
-    let d1 = sign(tri[0], tri[1]);
-    let d2 = sign(tri[1], tri[2]);
-    let d3 = sign(tri[2], tri[0]);
-    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
-    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
-    !(has_neg && has_pos)
+    base_common::build_app_icon_rgba(32)
 }
 
 /// Encodes a tooltip string into the 128-UTF-16-unit `NOTIFYICONDATAW::szTip` buffer.

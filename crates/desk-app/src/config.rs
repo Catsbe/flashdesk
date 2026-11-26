@@ -24,6 +24,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub revoked_device_ids: Vec<Uuid>,
     #[serde(default)]
+    pub hidden_revoked_device_ids: Vec<Uuid>,
+    #[serde(default)]
     pub last_revocation_cmd: Option<RevocationCommand>,
     pub selected_relay_id: Option<String>,
     #[serde(default)]
@@ -75,6 +77,7 @@ impl Default for AppConfig {
             local_device_name: None,
             issued_devices: Vec::new(),
             revoked_device_ids: Vec::new(),
+            hidden_revoked_device_ids: Vec::new(),
             last_revocation_cmd: None,
             selected_relay_id: None,
             preferred_file_relay_id: None,
@@ -190,6 +193,7 @@ impl AppConfig {
         self.local_device_name = Some(dev_name);
         self.issued_devices.clear();
         self.revoked_device_ids.clear();
+        self.hidden_revoked_device_ids.clear();
         self.last_revocation_cmd = None;
         self.bundle = Some(DeviceBundle {
             root_pubkey: root.pubkey_bytes(),
@@ -269,6 +273,19 @@ impl AppConfig {
         let cmd = root.sign_revocation_list(self.revoked_device_ids.clone());
         self.last_revocation_cmd = Some(cmd.clone());
         Ok(cmd)
+    }
+
+    /// Deletes a device record from the UI list. Only allowed when the device is already revoked;
+    /// keeps its UUID in `revoked_device_ids` so its certificate remains permanently blocked.
+    pub fn delete_revoked_device(&mut self, device_id: Uuid) -> bool {
+        if !self.revoked_device_ids.contains(&device_id) {
+            return false;
+        }
+        self.issued_devices.retain(|r| r.device_id != device_id);
+        if !self.hidden_revoked_device_ids.contains(&device_id) {
+            self.hidden_revoked_device_ids.push(device_id);
+        }
+        true
     }
 
     pub fn active_relay(&self) -> Option<&RelayNodeConfig> {
@@ -447,6 +464,28 @@ mod tests {
 
         // Mismatched root.key in the same folder must NOT load for foreign_bundle.
         assert!(!child_cfg.has_root_key(&cfg_path));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_revoked_device_requires_revoked_and_preserves_blacklist() {
+        let (cfg_path, dir) = temp_cfg_path("del-revoked");
+        let mut cfg = sample_config(&cfg_path);
+        let (_, active) = cfg.issue_device_bundle(&cfg_path, "ActivePC", 3650).unwrap();
+        let (_, revoked) = cfg.issue_device_bundle(&cfg_path, "OldPC", 3650).unwrap();
+        cfg.revoked_device_ids.push(revoked.device_id);
+
+        // Non-revoked device cannot be deleted.
+        assert!(!cfg.delete_revoked_device(active.device_id));
+        assert!(cfg.issued_devices.iter().any(|r| r.device_id == active.device_id));
+
+        // Revoked device is removed from issued_devices, hidden from manual fallback,
+        // and kept in revoked_device_ids so its certificate remains blocked.
+        assert!(cfg.delete_revoked_device(revoked.device_id));
+        assert!(!cfg.issued_devices.iter().any(|r| r.device_id == revoked.device_id));
+        assert!(cfg.revoked_device_ids.contains(&revoked.device_id));
+        assert!(cfg.hidden_revoked_device_ids.contains(&revoked.device_id));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

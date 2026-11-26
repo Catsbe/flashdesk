@@ -16,7 +16,7 @@
 
 | 目录 | 放什么 | 本文变量 |
 |---|---|---|
-| **项目目录** | 源码 + git 仓库，可在任意位置（例如 `E:\Antigravity项目\自用远程软件`） | `$Proj` |
+| **项目目录** | 源码 + git 仓库，可在任意位置（例如 `E:\Antigravity项目\flashdesk`） | `$Proj` |
 | **Rust 工具链** | `D:\Rust\rustup`、`D:\Rust\cargo`、`D:\Rust\mingw64` | — |
 | **编译输出** | `D:\Rust\target-flashdesk`，由 `.cargo\config.toml` 的 `target-dir` 指定，**不在项目目录里** | `$Out` |
 
@@ -28,7 +28,7 @@
 ### 每次打开 PowerShell 先执行
 
 ```powershell
-$Proj = "E:\Antigravity项目\自用远程软件"   # ← 改成你的项目目录
+$Proj = "E:\Antigravity项目\flashdesk"   # ← 改成你的项目目录
 $Out  = "D:\Rust\target-flashdesk"
 $env:RUSTUP_HOME = "D:\Rust\rustup"
 $env:CARGO_HOME  = "D:\Rust\cargo"
@@ -46,13 +46,15 @@ Set-Location $Proj
 cargo test --workspace
 ```
 
-预期共 **38 项全部 ok**：
+预期共 **69 项全部 ok**：
 
 | 测试集 | 数量 | 覆盖内容 |
 |---|---|---|
-| desk-app | 27 | `net::flow` 的 5M 链路仿真（60fps/延迟上限、带宽骤降、编码器超发、主控解码慢、旧版对端、ack 丢失、关键帧突发、轻负载抖动）；颜色转换与旧标量实现逐字节一致；缩放与分辨率上限；精确等待；基准标记块；文件传输；剪贴板 |
-| protocol | 6 | 含 `control_msg_variant_indices_are_stable`：新协议变体只能追加到枚举末尾 |
-| relay_e2e | 5 | 中转端端到端 |
+| desk-app | 39 | `net::flow` 的 5M 链路仿真；颜色转换与旧标量实现逐字节一致；缩放与分辨率上限；精确等待；基准标记块；文件传输；剪贴板；托盘与单实例；已吊销设备删除与黑名单保留 |
+| protocol | 14 | `control_msg_variant_indices_are_stable` 与 `relay_enum_variant_indices_are_stable`；`FLDP` 二进制差量与压缩往返；更新清单 Ed25519 验签与 semver |
+| base-common | 7 | 安装布局探测；原子 JSON 写；`SwitchRequest` 与 15s 看门狗转正/回滚拉黑；旧版本槽清理；`SERVICE_INTERACTIVE_CONTROL_SDDL`；图标 RGBA 绘制 |
+| relay_e2e | 7 | 中转端端到端（含 `UpdateChannel` 根签发布/分块下载与 `CheckUpdateNow` 远程触发） |
+| release-tool | 2 | `pack` 差量生成/清单签名与 `build-setup` 载荷提取校验 |
 
 ---
 
@@ -63,37 +65,62 @@ cargo build --release --workspace
 cargo build --release -p relay-server --target x86_64-unknown-linux-musl
 ```
 
-把产物从 `$Out` 复制回项目。先关掉正在运行的旧 `flashdesk.exe`，否则会提示文件被占用。
+打包独立安装器 `FlashDesk-Setup.exe` 并把产物从 `$Out` 复制回项目。先关掉正在运行的旧 `flashdesk.exe`，否则会提示文件被占用。
 
 ```powershell
 New-Item -ItemType Directory -Force "$Proj\target\release" | Out-Null
-Copy-Item "$Out\release\flashdesk.exe"       "$Proj\target\release\flashdesk.exe" -Force
-Copy-Item "$Out\release\flashdesk-relay.exe" "$Proj\target\release\flashdesk-relay.exe" -Force
+& "$Out\release\flashdesk-release.exe" build-setup `
+  --stub "$Out\release\flashdesk-setup-stub.exe" `
+  --svc "$Out\release\flashdesk-svc.exe" `
+  --launcher "$Out\release\flashdesk-launcher.exe" `
+  --uninstall "$Out\release\flashdesk-uninstall.exe" `
+  --core "$Out\release\flashdesk.exe" `
+  --version 0.1.1 `
+  --out "$Proj\target\release\FlashDesk-Setup.exe"
+
+Copy-Item "$Out\release\flashdesk.exe"         "$Proj\target\release\flashdesk.exe" -Force
+Copy-Item "$Out\release\flashdesk-relay.exe"   "$Proj\target\release\flashdesk-relay.exe" -Force
+Copy-Item "$Out\release\flashdesk-release.exe" "$Proj\target\release\flashdesk-release.exe" -Force
 Copy-Item "$Out\x86_64-unknown-linux-musl\release\flashdesk-relay" "$Proj\deploy\flashdesk-relay-linux-x86_64" -Force
 Copy-Item "$Out\x86_64-unknown-linux-musl\release\flashdesk-relay" "$Proj\target\release\flashdesk-relay-linux-x86_64" -Force
 ```
 
-### 打包审计（零 MinGW DLL）
+### 打包审计（零 MinGW DLL 与 `.rsrc` 图标资源）
 
 ```powershell
 Push-Location "$Out\release"
-D:\Rust\mingw64\bin\objdump.exe -p .\flashdesk.exe | Select-String "Subsystem|DLL Name"
+foreach ($bin in @("flashdesk.exe", "flashdesk-svc.exe", "flashdesk-launcher.exe", "flashdesk-uninstall.exe", "flashdesk-setup-stub.exe", "flashdesk-release.exe", "flashdesk-relay.exe")) {
+    Write-Host "=== $bin ==="
+    D:\Rust\mingw64\bin\objdump.exe -p ".\$bin" | Select-String "Subsystem|DLL Name"
+    D:\Rust\mingw64\bin\objdump.exe -h ".\$bin" | Select-String "\.rsrc"
+}
+Pop-Location
+Push-Location "$Proj\target\release"
+D:\Rust\mingw64\bin\objdump.exe -p .\FlashDesk-Setup.exe | Select-String "Subsystem|DLL Name"
+D:\Rust\mingw64\bin\objdump.exe -h .\FlashDesk-Setup.exe | Select-String "\.rsrc"
 Pop-Location
 ```
 
-- `Subsystem` 必须是 `00000002 (Windows GUI)`。
-- **不能出现** `libstdc++-6.dll`、`libwinpthread-1.dll`、`libgcc_s_seh-1.dll`。
+- GUI 类程序（`flashdesk.exe`、`flashdesk-svc.exe`、`flashdesk-launcher.exe`、`flashdesk-uninstall.exe`、`FlashDesk-Setup.exe`）的 `Subsystem` 必须是 `00000002 (Windows GUI)`，且 `objdump -h` 均需包含非空 `.rsrc` 图标节。
+- **所有二进制均不能出现** `libstdc++-6.dll`、`libwinpthread-1.dll`、`libgcc_s_seh-1.dll`。
 - `winmm.dll` 是系统库（1 ms 计时精度用），属于正常。
 
 ---
 
-## 3. 自检 `--self-test`（洁净 PATH）
+## 3. 自检 `--self-test` 与安装器静默联调（洁净 PATH）
 
 下面第一行会把 MinGW 和 cargo 从**当前会话**的 PATH 里去掉，用来证明程序不依赖它们。之后要再编译，请重开 PowerShell。
 
 ```powershell
 $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -and ($_ -notmatch 'mingw') -and ($_ -notmatch 'Rust\\cargo') }) -join ';'
 & "$Out\release\flashdesk.exe" --self-test | Out-String
+
+# 安装器与启动器端到端闭环验证（非提权临时目录模式）
+$tmpInst = Join-Path $env:TEMP "flashdesk-setup-verify"
+Remove-Item -Recurse -Force $tmpInst -ErrorAction SilentlyContinue
+Start-Process -FilePath "$Proj\target\release\FlashDesk-Setup.exe" -ArgumentList "--silent --no-service --no-shortcuts --dir `"$tmpInst`"" -Wait -PassThru
+& "$tmpInst\FlashDesk.exe" --self-test | Out-String
+Start-Process -FilePath "$tmpInst\bin\flashdesk-uninstall.exe" -ArgumentList "--silent --dir `"$tmpInst`"" -Wait -PassThru
 ```
 
 预期如下：
