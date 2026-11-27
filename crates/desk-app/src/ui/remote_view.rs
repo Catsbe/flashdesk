@@ -12,7 +12,9 @@ use protocol::auth::RelayNodeConfig;
 use protocol::session::{InputEvent, MonitorInfo, MouseBtn, VddRequest};
 use protocol::transfer::FileEntry;
 use std::path::{Path, PathBuf};
-use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_VSC};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC,
+};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ScaleMode {
@@ -38,7 +40,7 @@ pub struct RemoteViewState {
     /// Resolution cap by height (0 = native, 1080, 720).
     res_cap_h: u32,
     last_norm_pos: Option<(f32, f32)>,
-    prev_mods: Modifiers,
+    keys: KeyForwarder,
 
     // M2 + M3 interactive overlays
     clipboard_enabled: bool,
@@ -72,7 +74,7 @@ impl RemoteViewState {
             target_fps: initial_fps,
             res_cap_h: initial_res_cap_h,
             last_norm_pos: None,
-            prev_mods: Modifiers::NONE,
+            keys: KeyForwarder::default(),
             clipboard_enabled: true,
             show_file_panel: false,
             file_panel_initialized: false,
@@ -492,7 +494,16 @@ fn present_video(
             );
         });
     }
-    if !overlays_open {
+    if overlays_open {
+        // Forwarding pauses: release the clipboard-shortcut keys and modifiers the host still
+        // holds, or they would stay stuck there and a stale record would swallow the next
+        // shortcut press. (Other keys held at this moment are not tracked.)
+        let mut lifted = Vec::new();
+        state.keys.release_all(&mut lifted);
+        for ev in lifted {
+            session.send(ViewerCommand::Input(ev));
+        }
+    } else {
         forward_inputs(ctx, state, session, video_rect, pointer_in_video);
     }
 }
@@ -1380,11 +1391,8 @@ fn forward_inputs(
     pointer_in_video: bool,
 ) {
     let mut events_to_send = Vec::new();
-    let mut cur_mods = Modifiers::NONE;
 
     ctx.input(|i| {
-        cur_mods = i.modifiers;
-
         if pointer_in_video {
             if let Some(pos) = i.pointer.hover_pos() {
                 if video_rect.contains(pos) && video_rect.width() > 1.0 && video_rect.height() > 1.0
@@ -1413,7 +1421,13 @@ fn forward_inputs(
             }
         }
 
-        for ev in &i.events {
+        // Win32 key state of this (UI) thread: in step with the key messages egui has processed.
+        let key_down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
+        // ...and also physically held right now (the thread state can be stale after a focus
+        // change), for presses that are inferred without any event.
+        let held_now =
+            |vk: u16| key_down(vk) && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+        for (idx, ev) in i.events.iter().enumerate() {
             match ev {
                 Event::PointerButton {
                     pos,
@@ -1438,51 +1452,234 @@ fn forward_inputs(
                         });
                     }
                 }
-                Event::Key { key, pressed, .. } => {
-                    if *key == Key::F11 {
-                        continue;
-                    }
-                    if let Some((vk, ext)) = map_egui_key(*key) {
-                        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 };
-                        events_to_send.push(InputEvent::Key {
-                            vk,
-                            scan_code: scan,
-                            extended: ext,
-                            pressed: *pressed,
-                        });
-                    }
-                }
-                _ => {}
+                _ => state.keys.on_event(
+                    ev,
+                    &i.events[idx + 1..],
+                    i.modifiers,
+                    &key_down,
+                    &mut events_to_send,
+                ),
             }
         }
+        state
+            .keys
+            .end_frame(i.modifiers, i.focused, &held_now, &mut events_to_send);
     });
-
-    let mod_pairs = [
-        (state.prev_mods.ctrl, cur_mods.ctrl, 0xA2u16, false),
-        (state.prev_mods.shift, cur_mods.shift, 0xA0u16, false),
-        (state.prev_mods.alt, cur_mods.alt, 0xA4u16, false),
-        (
-            state.prev_mods.mac_cmd || state.prev_mods.command && !cur_mods.ctrl,
-            cur_mods.mac_cmd,
-            0x5Bu16,
-            true,
-        ),
-    ];
-    for (was, now, vk, ext) in mod_pairs {
-        if was != now {
-            let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) as u16 };
-            events_to_send.push(InputEvent::Key {
-                vk,
-                scan_code: scan,
-                extended: ext,
-                pressed: now,
-            });
-        }
-    }
-    state.prev_mods = cur_mods;
 
     for ev in events_to_send {
         session.send(ViewerCommand::Input(ev));
+    }
+}
+
+const VK_C: u16 = 0x43;
+const VK_V: u16 = 0x56;
+const VK_X: u16 = 0x58;
+const VK_INSERT: u16 = 0x2D;
+const VK_DELETE: u16 = 0x2E;
+const VK_LSHIFT: u16 = 0xA0;
+const VK_LCONTROL: u16 = 0xA2;
+const VK_LMENU: u16 = 0xA4;
+const VK_LWIN: u16 = 0x5B;
+
+/// Turns the viewer's egui keyboard events into remote key events.
+///
+/// egui-winit never reports the key-*down* of a clipboard shortcut as `Event::Key`: for
+/// Ctrl+C / Ctrl+X / Ctrl+V (and Ctrl+Insert, Shift+Insert, Shift+Delete) it emits
+/// `Event::Copy` / `Cut` / `Paste` instead, and for a paste nothing at all when the *local*
+/// clipboard holds no text (an image, files). Only the key-up arrives normally. Forwarding only
+/// `Event::Key` sent the host `Ctrl↓ C↑ Ctrl↑`, so copy / cut / paste never happened on the remote
+/// side (pitfall #21). Those key-downs are rebuilt here.
+///
+/// Modifiers are synced from each key event's own modifier state, so a modifier pressed in the
+/// same frame as the key still reaches the host first.
+#[derive(Default)]
+struct KeyForwarder {
+    /// Modifier state the host has been sent.
+    sent_mods: Modifiers,
+    /// Clipboard-shortcut keys (C, X, V, Insert, Delete) the host currently holds down.
+    shortcut_down: Vec<u16>,
+}
+
+impl KeyForwarder {
+    /// Handles one keyboard-related event. `rest` holds the events after `ev` in this frame;
+    /// `key_down(vk)` reads the Win32 key state of the UI thread.
+    fn on_event(
+        &mut self,
+        ev: &Event,
+        rest: &[Event],
+        frame_mods: Modifiers,
+        key_down: &dyn Fn(u16) -> bool,
+        out: &mut Vec<InputEvent>,
+    ) {
+        match ev {
+            Event::Key {
+                key,
+                pressed,
+                modifiers,
+                ..
+            } => {
+                // F11 toggles local fullscreen.
+                if *key == Key::F11 {
+                    return;
+                }
+                let Some((vk, ext)) = map_egui_key(*key) else {
+                    return;
+                };
+                self.sync_modifiers(*modifiers, out);
+                if is_shortcut_key(vk) {
+                    if !*pressed
+                        && !self.shortcut_down.contains(&vk)
+                        && egui_swallows_press(vk, *modifiers)
+                    {
+                        // Its key-down produced no event at all (a paste with no text on the
+                        // local clipboard, pressed and released between two frames): replay it.
+                        out.push(key_event(vk, ext, true));
+                    }
+                    self.set_shortcut_down(vk, *pressed);
+                }
+                out.push(key_event(vk, ext, *pressed));
+            }
+            Event::Copy | Event::Cut | Event::Paste(_) => {
+                let (letter, other) = match ev {
+                    Event::Copy => (VK_C, VK_INSERT),
+                    Event::Cut => (VK_X, VK_DELETE),
+                    _ => (VK_V, VK_INSERT),
+                };
+                let candidates = [letter, other];
+                // A fresh press is down right now; a held shortcut auto-repeats; a quick tap has
+                // already been released later in this frame.
+                let fresh = candidates
+                    .into_iter()
+                    .find(|vk| key_down(*vk) && !self.shortcut_down.contains(vk));
+                let repeat = candidates
+                    .into_iter()
+                    .find(|vk| self.shortcut_down.contains(vk));
+                let released_later = rest.iter().find_map(|e| match e {
+                    Event::Key {
+                        key, pressed: false, ..
+                    } => map_egui_key(*key)
+                        .map(|(vk, _)| vk)
+                        .filter(|vk| candidates.contains(vk)),
+                    _ => None,
+                });
+                let vk = fresh.or(repeat).or(released_later).unwrap_or(letter);
+
+                // egui-winit only emits these while the shortcut's modifier is held; it may have
+                // been released again within this frame.
+                let mut mods = frame_mods;
+                if vk == VK_DELETE || (vk == VK_INSERT && matches!(ev, Event::Paste(_))) {
+                    mods.shift = true;
+                } else {
+                    mods.ctrl = true;
+                    mods.command = true;
+                }
+                self.sync_modifiers(mods, out);
+                let ext = shortcut_key_extended(vk);
+                out.push(key_event(vk, ext, true));
+                if fresh.is_some() || repeat.is_some() || released_later.is_some() {
+                    self.set_shortcut_down(vk, true);
+                } else {
+                    // No key-up will follow (e.g. a dedicated Copy key): send a complete tap.
+                    out.push(key_event(vk, ext, false));
+                }
+            }
+            // winit already reports synthetic key-ups for held keys on focus loss; this catches
+            // anything it missed so nothing stays down on the host.
+            Event::WindowFocused(false) => self.release_shortcut_keys(out),
+            _ => {}
+        }
+    }
+
+    /// Runs after all events of a frame. `held_now(vk)`: the key is down both in the UI thread's
+    /// key state and physically right now.
+    fn end_frame(
+        &mut self,
+        frame_mods: Modifiers,
+        window_focused: bool,
+        held_now: &dyn Fn(u16) -> bool,
+        out: &mut Vec<InputEvent>,
+    ) {
+        self.sync_modifiers(frame_mods, out);
+        if !window_focused {
+            return;
+        }
+        // Ctrl+V / Shift+Insert with no text on the local clipboard produce no event at all: pick
+        // the press up from the key state so the host pastes on key-down, as a real keyboard would.
+        for vk in [VK_V, VK_INSERT] {
+            let silent_paste = match vk {
+                VK_V => frame_mods.command,
+                _ => frame_mods.shift && !frame_mods.ctrl,
+            };
+            if silent_paste && !self.shortcut_down.contains(&vk) && held_now(vk) {
+                self.set_shortcut_down(vk, true);
+                out.push(key_event(vk, shortcut_key_extended(vk), true));
+            }
+        }
+    }
+
+    /// Releases everything the host holds (forwarding is about to pause).
+    fn release_all(&mut self, out: &mut Vec<InputEvent>) {
+        self.release_shortcut_keys(out);
+        self.sync_modifiers(Modifiers::NONE, out);
+    }
+
+    fn release_shortcut_keys(&mut self, out: &mut Vec<InputEvent>) {
+        for vk in std::mem::take(&mut self.shortcut_down) {
+            out.push(key_event(vk, shortcut_key_extended(vk), false));
+        }
+    }
+
+    fn sync_modifiers(&mut self, target: Modifiers, out: &mut Vec<InputEvent>) {
+        let sent = self.sent_mods;
+        let pairs = [
+            (sent.ctrl, target.ctrl, VK_LCONTROL, false),
+            (sent.shift, target.shift, VK_LSHIFT, false),
+            (sent.alt, target.alt, VK_LMENU, false),
+            // macOS Command key (always false on Windows, where `command` mirrors Ctrl).
+            (sent.mac_cmd, target.mac_cmd, VK_LWIN, true),
+        ];
+        for (was, now, vk, ext) in pairs {
+            if was != now {
+                out.push(key_event(vk, ext, now));
+            }
+        }
+        self.sent_mods = target;
+    }
+
+    fn set_shortcut_down(&mut self, vk: u16, down: bool) {
+        self.shortcut_down.retain(|k| *k != vk);
+        if down {
+            self.shortcut_down.push(vk);
+        }
+    }
+}
+
+fn is_shortcut_key(vk: u16) -> bool {
+    matches!(vk, VK_C | VK_X | VK_V | VK_INSERT | VK_DELETE)
+}
+
+fn shortcut_key_extended(vk: u16) -> bool {
+    matches!(vk, VK_INSERT | VK_DELETE)
+}
+
+/// Mirrors egui-winit's `is_cut_command` / `is_copy_command` / `is_paste_command` on Windows:
+/// whether a press of `vk` with `mods` is turned into Copy / Cut / Paste instead of a key event.
+fn egui_swallows_press(vk: u16, mods: Modifiers) -> bool {
+    match vk {
+        VK_C | VK_X | VK_V => mods.command,
+        VK_INSERT => mods.ctrl || mods.shift,
+        VK_DELETE => mods.shift,
+        _ => false,
+    }
+}
+
+fn key_event(vk: u16, extended: bool, pressed: bool) -> InputEvent {
+    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 };
+    InputEvent::Key {
+        vk,
+        scan_code,
+        extended,
+        pressed,
     }
 }
 
@@ -1574,4 +1771,248 @@ fn map_egui_key(key: Key) -> Option<(u16, bool)> {
         _ => return None,
     };
     Some(pair)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Modifier state as egui-winit reports it on Windows (`command` mirrors Ctrl).
+    const NONE: Modifiers = Modifiers::NONE;
+    const CTRL: Modifiers = Modifiers {
+        alt: false,
+        ctrl: true,
+        shift: false,
+        mac_cmd: false,
+        command: true,
+    };
+    const SHIFT: Modifiers = Modifiers::SHIFT;
+
+    fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+        Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        }
+    }
+
+    /// Feeds one egui frame through the forwarder; returns `(vk, pressed)` pairs sent to the host.
+    fn frame(
+        fwd: &mut KeyForwarder,
+        events: &[Event],
+        mods: Modifiers,
+        down: &[u16],
+    ) -> Vec<(u16, bool)> {
+        let key_down = |vk: u16| down.contains(&vk);
+        let mut out = Vec::new();
+        for (idx, ev) in events.iter().enumerate() {
+            fwd.on_event(ev, &events[idx + 1..], mods, &key_down, &mut out);
+        }
+        fwd.end_frame(mods, true, &key_down, &mut out);
+        pairs(out)
+    }
+
+    fn pairs(out: Vec<InputEvent>) -> Vec<(u16, bool)> {
+        out.into_iter()
+            .map(|e| match e {
+                InputEvent::Key { vk, pressed, .. } => (vk, pressed),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shift_insert_without_local_text_is_picked_up_from_key_state() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[], SHIFT, &[VK_INSERT]),
+            [(VK_LSHIFT, true), (VK_INSERT, true)]
+        );
+    }
+
+    #[test]
+    fn copy_without_any_key_evidence_sends_a_complete_tap() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[Event::Copy], CTRL, &[]),
+            [(VK_LCONTROL, true), (VK_C, true), (VK_C, false)]
+        );
+        assert!(f.shortcut_down.is_empty(), "nothing may stay held");
+    }
+
+    #[test]
+    fn focus_loss_and_paused_forwarding_release_held_keys() {
+        let mut f = KeyForwarder::default();
+        frame(&mut f, &[Event::Copy], CTRL, &[VK_C]);
+        assert_eq!(
+            frame(&mut f, &[Event::WindowFocused(false)], NONE, &[]),
+            [(VK_C, false), (VK_LCONTROL, false)]
+        );
+        frame(&mut f, &[Event::Paste("t".into())], CTRL, &[VK_V]);
+        let mut out = Vec::new();
+        f.release_all(&mut out);
+        assert_eq!(pairs(out), [(VK_V, false), (VK_LCONTROL, false)]);
+        // No stale record left: the next Ctrl+V without local text is still picked up.
+        assert_eq!(
+            frame(&mut f, &[], CTRL, &[VK_V]),
+            [(VK_LCONTROL, true), (VK_V, true)]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_press_reaches_host() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(frame(&mut f, &[], CTRL, &[]), [(VK_LCONTROL, true)]);
+        // egui-winit swallows the C key-down and emits Copy instead.
+        assert_eq!(frame(&mut f, &[Event::Copy], CTRL, &[VK_C]), [(VK_C, true)]);
+        assert_eq!(
+            frame(&mut f, &[key(Key::C, false, CTRL)], CTRL, &[]),
+            [(VK_C, false)]
+        );
+        assert_eq!(frame(&mut f, &[], NONE, &[]), [(VK_LCONTROL, false)]);
+    }
+
+    #[test]
+    fn ctrl_x_and_ctrl_v_with_text_reach_host() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[Event::Cut], CTRL, &[VK_X]),
+            [(VK_LCONTROL, true), (VK_X, true)]
+        );
+        assert_eq!(
+            frame(&mut f, &[key(Key::X, false, CTRL)], CTRL, &[]),
+            [(VK_X, false)]
+        );
+        assert_eq!(
+            frame(&mut f, &[Event::Paste("local text".into())], CTRL, &[VK_V]),
+            [(VK_V, true)]
+        );
+        assert_eq!(
+            frame(&mut f, &[key(Key::V, false, CTRL)], CTRL, &[]),
+            [(VK_V, false)]
+        );
+    }
+
+    #[test]
+    fn ctrl_v_without_local_text_is_picked_up_from_key_state() {
+        // An image on the local clipboard: egui-winit emits no event for the V key-down at all.
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[], CTRL, &[VK_V]),
+            [(VK_LCONTROL, true), (VK_V, true)]
+        );
+        // Still held: no duplicate press.
+        assert_eq!(frame(&mut f, &[], CTRL, &[VK_V]), []);
+        assert_eq!(
+            frame(&mut f, &[key(Key::V, false, CTRL)], CTRL, &[]),
+            [(VK_V, false)]
+        );
+    }
+
+    #[test]
+    fn silent_paste_tapped_between_frames_is_replayed_at_key_up() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[key(Key::V, false, CTRL)], CTRL, &[]),
+            [(VK_LCONTROL, true), (VK_V, true), (VK_V, false)]
+        );
+    }
+
+    #[test]
+    fn whole_shortcut_within_one_frame_keeps_ctrl_around_the_press() {
+        // Ctrl↓ C↓ Ctrl↑ C↑ all processed before the frame ran.
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[Event::Copy, key(Key::C, false, NONE)], NONE, &[]),
+            [
+                (VK_LCONTROL, true),
+                (VK_C, true),
+                (VK_LCONTROL, false),
+                (VK_C, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_and_delete_shortcuts_send_the_real_key() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[Event::Copy], CTRL, &[VK_INSERT]),
+            [(VK_LCONTROL, true), (VK_INSERT, true)]
+        );
+        assert_eq!(
+            frame(&mut f, &[key(Key::Insert, false, CTRL)], NONE, &[]),
+            [(VK_INSERT, false), (VK_LCONTROL, false)]
+        );
+        assert_eq!(
+            frame(&mut f, &[Event::Paste("t".into())], SHIFT, &[VK_INSERT]),
+            [(VK_LSHIFT, true), (VK_INSERT, true)]
+        );
+        assert_eq!(
+            frame(&mut f, &[key(Key::Insert, false, SHIFT)], SHIFT, &[]),
+            [(VK_INSERT, false)]
+        );
+        assert_eq!(
+            frame(&mut f, &[Event::Cut], SHIFT, &[VK_DELETE]),
+            [(VK_DELETE, true)]
+        );
+        let mut out = Vec::new();
+        f.on_event(&Event::Cut, &[], SHIFT, &|_| false, &mut out);
+        let InputEvent::Key { extended, .. } = out[0] else {
+            panic!("expected a key event");
+        };
+        assert!(extended, "Insert/Delete are extended keys");
+    }
+
+    #[test]
+    fn held_shortcut_auto_repeats() {
+        let mut f = KeyForwarder::default();
+        frame(&mut f, &[Event::Copy], CTRL, &[VK_C]);
+        assert_eq!(frame(&mut f, &[Event::Copy], CTRL, &[VK_C]), [(VK_C, true)]);
+    }
+
+    #[test]
+    fn plain_typing_is_forwarded_once() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(
+                &mut f,
+                &[key(Key::C, true, NONE), key(Key::C, false, NONE)],
+                NONE,
+                &[VK_C]
+            ),
+            [(VK_C, true), (VK_C, false)]
+        );
+        // Plain V held down: egui reported it, so the key-state poll must not press it again.
+        assert_eq!(
+            frame(&mut f, &[key(Key::V, true, NONE)], CTRL, &[VK_V]),
+            [(VK_V, true), (VK_LCONTROL, true)]
+        );
+    }
+
+    #[test]
+    fn modifier_pressed_in_the_same_frame_goes_first() {
+        let mut f = KeyForwarder::default();
+        assert_eq!(
+            frame(&mut f, &[key(Key::A, true, CTRL)], CTRL, &[]),
+            [(VK_LCONTROL, true), (0x41, true)]
+        );
+    }
+
+    #[test]
+    fn releasing_ctrl_sends_no_windows_key() {
+        let mut f = KeyForwarder::default();
+        frame(&mut f, &[], CTRL, &[]);
+        assert_eq!(frame(&mut f, &[], NONE, &[]), [(VK_LCONTROL, false)]);
+    }
+
+    #[test]
+    fn unfocused_window_does_not_poll_key_state() {
+        let mut f = KeyForwarder::default();
+        let mut out = Vec::new();
+        f.end_frame(CTRL, false, &|vk| vk == VK_V, &mut out);
+        assert_eq!(out.len(), 1, "only the Ctrl sync, no V press: {out:?}");
+    }
 }

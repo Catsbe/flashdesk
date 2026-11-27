@@ -10,6 +10,11 @@ use std::time::Duration;
 use windows::Win32::System::DataExchange::GetClipboardSequenceNumber;
 
 pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+/// Larger text is not synced: a single control message that size holds up input for seconds on
+/// a small relay, and anything over the 16 MiB Noise frame limit would end the session.
+pub const MAX_CLIPBOARD_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Cap for the one-off push of text already on the clipboard when a session starts.
+pub const MAX_INITIAL_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct ClipboardSync {
@@ -67,20 +72,86 @@ impl ClipboardSync {
         }
     }
 
+    /// Short `(kind, bytes)` description for logs (never the content).
+    pub fn describe(data: &ClipboardData) -> (&'static str, usize) {
+        match data {
+            ClipboardData::Text(t) => ("text", t.len()),
+            ClipboardData::ImagePng(b) => ("image", b.len()),
+        }
+    }
+
+    /// Local text worth sending to the peer: non-empty, at most `limit` bytes, and different from
+    /// what was last sent or applied (then recorded as the latest hash).
+    pub fn local_text_update(&self, text: String, limit: usize) -> Option<ClipboardData> {
+        if text.is_empty() {
+            return None;
+        }
+        if text.len() > limit {
+            tracing::warn!(
+                "clipboard text too large to sync ({} bytes > {limit})",
+                text.len()
+            );
+            return None;
+        }
+        let data = ClipboardData::Text(text);
+        self.record_if_new(&data).then_some(data)
+    }
+
+    fn local_image_update(&self, img: &ImageData) -> Option<ClipboardData> {
+        let png = encode_rgba_to_png(img.width as u32, img.height as u32, img.bytes.as_ref()).ok()?;
+        if png.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            tracing::warn!(
+                "clipboard image too large ({} bytes > 8 MiB), skipping sync",
+                png.len()
+            );
+            return None;
+        }
+        let data = ClipboardData::ImagePng(png);
+        self.record_if_new(&data).then_some(data)
+    }
+
     /// Writes remote clipboard data locally while preventing echo loops back to the peer.
     pub fn apply_remote(&self, data: &ClipboardData) -> Result<()> {
         if !self.enabled.load(Ordering::Relaxed) {
             return Ok(());
         }
         let hash = Self::hash_data(data);
-        {
+        let prev_hash = {
             let mut guard = self.last_hash.lock().unwrap();
             if *guard == hash {
                 return Ok(());
             }
-            *guard = hash;
+            std::mem::replace(&mut *guard, hash)
+        };
+
+        // Another program may hold the clipboard for a moment; this runs on its own thread.
+        let mut attempt = 0;
+        while let Err(e) = Self::write_local(data) {
+            let busy = matches!(
+                e.downcast_ref::<arboard::Error>(),
+                Some(arboard::Error::ClipboardOccupied)
+            );
+            if busy && attempt < 4 {
+                attempt += 1;
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            // Not applied: forget the hash so the same content is not deduplicated away later.
+            let mut guard = self.last_hash.lock().unwrap();
+            if *guard == hash {
+                *guard = prev_hash;
+            }
+            return Err(e);
         }
 
+        let seq = unsafe { GetClipboardSequenceNumber() };
+        self.last_seq.store(seq, Ordering::Relaxed);
+        let (kind, bytes) = Self::describe(data);
+        tracing::info!("clipboard: applied {kind} from peer ({bytes} bytes)");
+        Ok(())
+    }
+
+    fn write_local(data: &ClipboardData) -> Result<()> {
         let mut cb = Clipboard::new().context("failed to open Windows clipboard")?;
         match data {
             ClipboardData::Text(text) => {
@@ -100,22 +171,36 @@ impl ClipboardSync {
                 .context("failed to set clipboard image")?;
             }
         }
-
-        let seq = unsafe { GetClipboardSequenceNumber() };
-        self.last_seq.store(seq, Ordering::Relaxed);
         Ok(())
     }
 
     /// Spawns a background clipboard watcher thread that fires `on_local_change`
     /// whenever local text or image content changes.
-    pub fn spawn_watcher<F>(&self, stop: Arc<AtomicBool>, on_local_change: F)
+    ///
+    /// With `push_initial_text`, text already on the clipboard when the session starts is sent
+    /// once right away, so "copy here, connect, paste there" works (the viewer side uses this;
+    /// both sides doing it would swap the two clipboards). Images are left to the next change:
+    /// a multi-megabyte PNG would hold up input on a small relay right after connecting.
+    pub fn spawn_watcher<F>(&self, stop: Arc<AtomicBool>, push_initial_text: bool, on_local_change: F)
     where
         F: Fn(ClipboardData) + Send + 'static,
     {
         let sync = self.clone();
+        let notify = move |data: ClipboardData| {
+            let (kind, bytes) = Self::describe(&data);
+            tracing::info!("clipboard: sending local {kind} to peer ({bytes} bytes)");
+            on_local_change(data);
+        };
         let _ = std::thread::Builder::new()
             .name("flashdesk-clipboard".into())
             .spawn(move || {
+                if push_initial_text && sync.enabled.load(Ordering::Relaxed) {
+                    if let Ok(text) = Clipboard::new().and_then(|mut cb| cb.get_text()) {
+                        if let Some(data) = sync.local_text_update(text, MAX_INITIAL_TEXT_BYTES) {
+                            notify(data);
+                        }
+                    }
+                }
                 while !stop.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(250));
                     if !sync.enabled.load(Ordering::Relaxed) {
@@ -126,38 +211,26 @@ impl ClipboardSync {
                     if seq == 0 || seq == prev {
                         continue;
                     }
-                    sync.last_seq.store(seq, Ordering::Relaxed);
 
+                    // `continue` before recording `seq` = read again next tick (clipboard held
+                    // by another program); the change is not lost.
                     let Ok(mut cb) = Clipboard::new() else {
                         continue;
                     };
-                    if let Ok(text) = cb.get_text() {
-                        if !text.is_empty() {
-                            let data = ClipboardData::Text(text);
-                            if sync.record_if_new(&data) {
-                                on_local_change(data);
-                            }
-                            continue;
+                    let update = match cb.get_text() {
+                        Ok(text) if !text.is_empty() => {
+                            sync.local_text_update(text, MAX_CLIPBOARD_TEXT_BYTES)
                         }
-                    }
-                    if let Ok(img) = cb.get_image() {
-                        if let Ok(png_bytes) = encode_rgba_to_png(
-                            img.width as u32,
-                            img.height as u32,
-                            img.bytes.as_ref(),
-                        ) {
-                            if png_bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES {
-                                let data = ClipboardData::ImagePng(png_bytes);
-                                if sync.record_if_new(&data) {
-                                    on_local_change(data);
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "clipboard image too large ({} bytes > 8 MiB), skipping sync",
-                                    png_bytes.len()
-                                );
-                            }
-                        }
+                        Err(arboard::Error::ClipboardOccupied) => continue,
+                        _ => match cb.get_image() {
+                            Ok(img) => sync.local_image_update(&img),
+                            Err(arboard::Error::ClipboardOccupied) => continue,
+                            Err(_) => None,
+                        },
+                    };
+                    sync.last_seq.store(seq, Ordering::Relaxed);
+                    if let Some(data) = update {
+                        notify(data);
                     }
                 }
             });
@@ -243,6 +316,25 @@ mod tests {
         let (dw, dh, drgba) = decode_png_to_rgba(&png).unwrap();
         assert_eq!((dw, dh), (w, h));
         assert_eq!(drgba, rgba);
+    }
+
+    #[test]
+    fn text_updates_respect_size_limit_and_dedup() {
+        let sync = ClipboardSync::new(true);
+        assert!(sync.local_text_update(String::new(), 10).is_none(), "empty");
+        assert!(sync.local_text_update("x".repeat(11), 10).is_none(), "over the limit");
+        assert!(sync.local_text_update("x".repeat(10), 10).is_some(), "at the limit");
+        assert!(sync.local_text_update("x".repeat(10), 10).is_none(), "duplicate");
+        // A rejected text is not recorded: the same text still goes out under a larger limit.
+        assert!(sync.local_text_update("y".repeat(20), 10).is_none());
+        assert!(sync.local_text_update("y".repeat(20), 100).is_some());
+    }
+
+    #[test]
+    fn text_limits_stay_well_below_the_frame_limit() {
+        assert!(MAX_INITIAL_TEXT_BYTES < MAX_CLIPBOARD_TEXT_BYTES);
+        // bincode adds a few bytes of enum tags and length prefixes around the text.
+        assert!(MAX_CLIPBOARD_TEXT_BYTES + 1024 < protocol::framing::MAX_FRAME_LEN);
     }
 
     #[test]

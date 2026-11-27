@@ -46,13 +46,13 @@ Set-Location $Proj
 cargo test --workspace
 ```
 
-预期共 **69 项全部 ok**：
+预期共 **86 项全部 ok**：
 
 | 测试集 | 数量 | 覆盖内容 |
 |---|---|---|
-| desk-app | 39 | `net::flow` 的 5M 链路仿真；颜色转换与旧标量实现逐字节一致；缩放与分辨率上限；精确等待；基准标记块；文件传输；剪贴板；托盘与单实例；已吊销设备删除与黑名单保留 |
+| desk-app | 55 | `net::flow` 的 5M 链路仿真；颜色转换与旧标量实现逐字节一致；缩放与分辨率上限；精确等待；基准标记块；文件传输；剪贴板；远控键盘快捷键转发（Ctrl+C/V/X 等被 egui 吞掉的按下，坑 #21）；剪贴板文字大小上限；托盘与单实例；已吊销设备删除与黑名单保留 |
 | protocol | 14 | `control_msg_variant_indices_are_stable` 与 `relay_enum_variant_indices_are_stable`；`FLDP` 二进制差量与压缩往返；更新清单 Ed25519 验签与 semver |
-| base-common | 7 | 安装布局探测；原子 JSON 写；`SwitchRequest` 与 15s 看门狗转正/回滚拉黑；旧版本槽清理；`SERVICE_INTERACTIVE_CONTROL_SDDL`；图标 RGBA 绘制 |
+| base-common | 8 | 安装布局探测；原子 JSON 写；`SwitchRequest` 与 15s 看门狗转正/回滚拉黑；旧版本槽清理；`SERVICE_INTERACTIVE_CONTROL_SDDL`；图标 RGBA 绘制 |
 | relay_e2e | 7 | 中转端端到端（含 `UpdateChannel` 根签发布/分块下载与 `CheckUpdateNow` 远程触发） |
 | release-tool | 2 | `pack` 差量生成/清单签名与 `build-setup` 载荷提取校验 |
 
@@ -286,7 +286,12 @@ sudo systemctl start flashdesk-relay
 | 窗口里播放视频 | 自适应码率稳定在链路以下（5M 中转约 4–4.5 Mbps）；画面可以变糊，但不能出现秒级延迟 |
 | 记事本打字、点菜单 | 立刻出现（< 0.1 s），不再"隔一下才变" |
 | 工具栏「画质」里切换 1080p / 原始分辨率 | 短暂刷新一下，然后流畅 |
+| 远端选中文字按 Ctrl+C，回到本机 Ctrl+V | 本机粘贴出远端的文字（Ctrl+X、Ctrl+Insert 同理） |
+| 本机复制文字，在远端按 Ctrl+V（Shift+Insert 同理） | 远端粘贴出本机的文字；**连接前**复制的文字（≤ 256 KiB）连上后也能直接粘贴 |
+| 本机复制一张小图片，在远端支持图片的程序里 Ctrl+V | 远端粘贴出图片 |
 | 复制一张大截图（剪贴板图片） | 键鼠可能卡几秒，**这是已知遗留问题，尚未修复**（见架构文档「五、后续方向」） |
+
+> 剪贴板没同步时，看两端日志里的 `clipboard: sending local … to peer` / `clipboard: applied … from peer`（只记类型和字节数，不记内容）和 `apply remote clipboard failed`，就能判断卡在哪一端。
 
 ---
 

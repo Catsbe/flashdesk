@@ -311,12 +311,14 @@ pub async fn run_host_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
         let _ = ctrl_out_tx.try_send(ControlMsg::VddStatus(vdd_info));
     }
 
-    // Clipboard bidirectional sync
+    // Clipboard bidirectional sync. The viewer pushes its clipboard text on connect; the host
+    // only sends later changes. The watcher is a plain thread: wait for queue space rather than
+    // drop an update (its hash is already recorded, so a dropped one would never be resent).
     let clipboard_sync = ClipboardSync::new(true);
     {
         let cb_ctrl_tx = ctrl_out_tx.clone();
-        clipboard_sync.spawn_watcher(Arc::clone(&stop_flag), move |data| {
-            let _ = cb_ctrl_tx.try_send(ControlMsg::Clipboard(data));
+        clipboard_sync.spawn_watcher(Arc::clone(&stop_flag), false, move |data| {
+            let _ = cb_ctrl_tx.blocking_send(ControlMsg::Clipboard(data));
         });
     }
 
@@ -484,7 +486,7 @@ pub async fn run_host_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static
                 let sync = clipboard_sync.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = sync.apply_remote(&data) {
-                        tracing::debug!("apply remote clipboard failed: {e}");
+                        tracing::warn!("apply remote clipboard failed: {e:#}");
                     }
                 });
             }

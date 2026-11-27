@@ -460,12 +460,14 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let flow_enabled = Arc::new(AtomicBool::new(false));
     let (ack_tx, mut ack_rx) = mpsc::channel::<ControlMsg>(64);
 
-    // Bidirectional clipboard sync
+    // Bidirectional clipboard sync. Text already on the local clipboard is pushed on connect so
+    // "copy here, then connect and paste there" works. Plain watcher thread: wait for queue space
+    // instead of dropping an update (its hash is recorded already, it would never be resent).
     let clipboard_sync = ClipboardSync::with_enabled_flag(Arc::clone(&handle.clipboard_enabled));
     {
         let cb_tx = ctrl_out_tx.clone();
-        clipboard_sync.spawn_watcher(Arc::clone(&stop_flag), move |data| {
-            let _ = cb_tx.try_send(ControlMsg::Clipboard(data));
+        clipboard_sync.spawn_watcher(Arc::clone(&stop_flag), true, move |data| {
+            let _ = cb_tx.blocking_send(ControlMsg::Clipboard(data));
         });
     }
 
@@ -746,7 +748,9 @@ async fn run_viewer_loop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                                 ControlMsg::Clipboard(data) => {
                                     let sync = clipboard_sync.clone();
                                     std::thread::spawn(move || {
-                                        let _ = sync.apply_remote(&data);
+                                        if let Err(e) = sync.apply_remote(&data) {
+                                            tracing::warn!("apply remote clipboard failed: {e:#}");
+                                        }
                                     });
                                 }
                                 ControlMsg::VddStatus(info) => {

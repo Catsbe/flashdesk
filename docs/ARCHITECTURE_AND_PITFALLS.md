@@ -1,6 +1,6 @@
 # FlashDesk 架构设计、开发约束与踩坑交接文档
 
-> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#20）。
+> 本文档面向后续接手维护、排错与扩展开发 **FlashDesk** 的 AI Agent 及人类开发者，完整记录已定稿的系统架构、模块职责、工具链与打包规范，以及开发和真机联调过程中实际踩过并已解决的全部核心问题（Pitfalls #1–#21）。
 > **安装程序与自动更新架构详述见：[AUTO_UPDATE_AND_INSTALLER.md](AUTO_UPDATE_AND_INSTALLER.md)。**
 
 ---
@@ -167,7 +167,7 @@ $env:FLASHDESK_MINGW_DIR = "C:\Rust\mingw64"   # build.rs 的静态库搜索路�
 
 ### 2. 全量测试与双平台 Release 编译命令
 ```powershell
-# 1) 运行全部单元与集成测试（base-common 7 + desk-app 39 + protocol 14 + relay_e2e 7 + release-tool 2 = 69 项，含 flow.rs 的 5M 链路仿真）
+# 1) 运行全部单元与集成测试（base-common 8 + desk-app 55 + protocol 14 + relay_e2e 7 + release-tool 2 = 86 项，含 flow.rs 的 5M 链路仿真）
 cargo test --workspace
 
 # 2) 编译 Windows Release（flashdesk.exe 与 flashdesk-relay.exe）
@@ -211,7 +211,7 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
 
 ---
 
-## 四、完整踩坑记录与避坑红线（Pitfalls #1–#20）
+## 四、完整踩坑记录与避坑红线（Pitfalls #1–#21）
 
 ### A. 工具链、编译与打包类
 
@@ -284,6 +284,19 @@ Copy-Item "D:\Rust\target-flashdesk\x86_64-unknown-linux-musl\release\flashdesk-
   - 主页/设置页：右侧控件先排（`right_to_left`），文字在剩余宽度内换行或截断（`theme::hint` / `label_max_width`，悬停看全文）；输入框、节点表格列宽随卡片宽度计算；标签行改用 `horizontal_wrapped`（`theme::chip` 改为固定尺寸绘制，才能换行）。
   - 远控：文件传输 / 虚拟屏窗口限制在画面内且避开顶部工具栏（`constrain_to` + `max_size`），列表高度按剩余空间分配、内容可整体滚动；小窗口 HUD 只显示首行；1:1 画面超出窗口时用常显滚动条平移（鼠标滚轮仍发给远端）。
   - **红线**：新增行内控件时，在 640×440 最小窗口下检查是否会撑宽整列；不要再写死大于 640 的宽度。
+
+#### 坑 #21：远控里 Ctrl+C / Ctrl+V / Ctrl+X 完全无效——egui-winit 吞掉了剪贴板快捷键的「按下」（2026-11-27 修复）
+- **现象**：远程会话里复制粘贴没反应：远端选中文字按 Ctrl+C 复制不到，本机复制后到远端 Ctrl+V 也粘不出来；Ctrl+A 等其它快捷键正常。
+- **根因**：
+  1. egui-winit 0.31（`on_keyboard_input`）对 Ctrl+C / Ctrl+X / Ctrl+V（Windows 上还有 Ctrl+Insert、Shift+Insert、Shift+Delete）的**按下**不发 `Event::Key`，改发 `Event::Copy` / `Cut` / `Paste`；本地剪贴板里没有文字（如图片）时，Ctrl+V 连 `Paste` 都不发。只有**松开**照常发 `Event::Key`。
+  2. `forward_inputs` 只转发 `Event::Key`，被控端实际收到的是 `Ctrl↓ C↑ Ctrl↑`，从来没有 C 的按下。
+  3. 附带问题：修饰键按帧比较后统一补发在按键之后，同一帧里按下的 Ctrl 会晚于字母到达；每次松开 Ctrl 还会多发一个 Win 键松开（旧表达式 `prev.command && !cur.ctrl` 在 Windows 上恒成立）。
+  4. 剪贴板：会话开始时已有的剪贴板内容不同步（先复制再连接，远端粘的是旧内容）；监视线程用 `try_send`，队列满时更新被丢弃，又因哈希已记录而永不重发。
+- **方案（已落地）**：
+  - [ui/remote_view.rs](../crates/desk-app/src/ui/remote_view.rs) `KeyForwarder`：收到 Copy/Cut/Paste 时用 `GetKeyState`（UI 线程的键盘状态，与已处理的按键消息同步）判断实际按的是 C/X/V 还是 Insert/Delete 并补发按下；帧末在窗口有焦点时检查 V/Insert，补上「本地无文字的 Ctrl+V」这种没有任何事件的按下；若到松开都没见过按下（两帧之间快速点按），先补按下再发松开。帧末补按下除了 `GetKeyState` 还要求 `GetAsyncKeyState` 也是按下（焦点切换后线程键盘状态可能过期）。窗口失焦或打开文件传输 / 虚拟屏浮窗（暂停转发）时，把已转发的快捷键和修饰键全部松开。修饰键按每个按键事件自带的 modifiers 同步，保证先于按键到达；去掉误发的 Win 键。
+  - [clipboard/mod.rs](../crates/desk-app/src/clipboard/mod.rs)：主控端连接时推送一次本地剪贴板**文字**（≤ 256 KiB；图片不推，避免大图在 5M 中转上卡住键鼠）；被控端不推，否则两边剪贴板会互换。会话中文字同步上限 8 MiB（与图片一致），超限只记 warn 不发送——**单条控制消息超过 16 MiB（`MAX_FRAME_LEN`）会直接断开会话**。监视线程改 `blocking_send`（普通线程，不在 tokio 上下文里）；剪贴板被别的程序占用时下一轮重读、写入时重试，失败才放弃且不记哈希。同步与写入失败按「类型 + 字节数」记日志，不记内容。
+- **验证**：`ui::remote_view::tests` 14 个 + `clipboard::tests` 2 个新单测；同机端到端（真实 `SendInput` → 主控 GUI → 0.7 s 延迟代理 → `--agent` 注入 → 目标窗口）新版 Ctrl+V / Ctrl+C / Ctrl+X / Shift+Insert / 图片 Ctrl+V / 普通打字共 6/6 通过，旧版前 5 项全部失败（目标窗口只收到 `Ctrl↓ V↑ Ctrl↑ LWin↑`）；剪贴板放 20 MiB 文字再连接、会话中复制 10 MiB 文字，均只记 warn，会话不断。同机测试必须加延迟代理并在注入前把焦点交给目标窗口，否则被控端注入的按键会回灌主控窗口形成死循环。
+- **红线**：远控键盘转发不能只看 `Event::Key`；升级 egui / eframe 后必须重新核对 egui-winit 的 `is_cut_command` / `is_copy_command` / `is_paste_command` 与 `egui_swallows_press` 是否一致，并跑 `ui::remote_view::tests`。
 
 ---
 
