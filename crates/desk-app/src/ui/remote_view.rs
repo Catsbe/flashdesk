@@ -48,7 +48,9 @@ pub struct RemoteViewState {
     file_panel_initialized: bool,
     show_vdd_window: bool,
     local_dir: String,
+    local_dir_input: String,
     local_entries: Vec<FileEntry>,
+    local_roots: Vec<FileEntry>,
     local_error: Option<String>,
     remote_dir_input: String,
     last_synced_remote_dir: String,
@@ -80,7 +82,9 @@ impl RemoteViewState {
             file_panel_initialized: false,
             show_vdd_window: false,
             local_dir: String::new(),
+            local_dir_input: String::new(),
             local_entries: Vec::new(),
+            local_roots: Vec::new(),
             local_error: None,
             remote_dir_input: String::new(),
             last_synced_remote_dir: String::new(),
@@ -90,12 +94,23 @@ impl RemoteViewState {
     }
 
     fn refresh_local_dir(&mut self) {
-        match list_local_dir(&self.local_dir) {
+        let cur = self.local_dir.clone();
+        self.navigate_local_dir(cur);
+    }
+
+    fn navigate_local_dir(&mut self, target: String) {
+        match list_local_dir(&target) {
             Ok(list) => {
+                if target.trim().is_empty() {
+                    self.local_roots = list.clone();
+                }
+                self.local_dir = target.clone();
+                self.local_dir_input = target;
                 self.local_entries = list;
                 self.local_error = None;
             }
             Err(e) => {
+                self.local_dir_input = target;
                 self.local_error = Some(e.to_string());
             }
         }
@@ -785,12 +800,96 @@ enum RowAction {
     Transfer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryIcon {
+    Computer,
+    Desktop,
+    Documents,
+    Downloads,
+    Drive,
+    Folder,
+    File,
+}
+
+fn is_drive_root(path: &str) -> bool {
+    let b = path.trim().as_bytes();
+    b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+}
+
+fn normalize_path_for_match(path: &str) -> String {
+    let mut s = path.trim().replace('/', "\\").to_lowercase();
+    if s.is_empty() {
+        return s;
+    }
+    let b = s.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        s.push('\\');
+        return s;
+    }
+    while s.len() > 3 && s.ends_with('\\') {
+        s.pop();
+    }
+    s
+}
+
+fn paths_equal_ci(a: &str, b: &str) -> bool {
+    let na = normalize_path_for_match(a);
+    let nb = normalize_path_for_match(b);
+    !na.is_empty() && na == nb
+}
+
+fn is_root_shortcut_name(name: &str) -> bool {
+    let n = name.trim();
+    n == "桌面"
+        || n.starts_with("桌面 ")
+        || n == "文档"
+        || n.starts_with("文档 ")
+        || n == "下载"
+        || n.starts_with("下载 ")
+}
+
+fn is_quick_folder_entry(entry: &FileEntry) -> bool {
+    is_root_shortcut_name(&entry.name) || !is_drive_root(&entry.path)
+}
+
+fn classify_entry_icon(entry: &FileEntry, is_root_view: bool) -> EntryIcon {
+    if !entry.is_dir {
+        return EntryIcon::File;
+    }
+    if is_root_view {
+        let name = entry.name.trim();
+        if name == "桌面" || name.starts_with("桌面 ") {
+            return EntryIcon::Desktop;
+        }
+        if name == "文档" || name.starts_with("文档 ") {
+            return EntryIcon::Documents;
+        }
+        if name == "下载" || name.starts_with("下载 ") {
+            return EntryIcon::Downloads;
+        }
+    }
+    if is_drive_root(&entry.path) {
+        return EntryIcon::Drive;
+    }
+    EntryIcon::Folder
+}
+
 /// One file / folder row: click a folder to open it, the button transfers a file.
-fn entry_row(ui: &mut egui::Ui, entry: &FileEntry, transfer_label: &str) -> RowAction {
+fn entry_row(
+    ui: &mut egui::Ui,
+    idx: usize,
+    entry: &FileEntry,
+    transfer_label: &str,
+    is_root_view: bool,
+) -> RowAction {
     let mut act = RowAction::None;
     let row_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 28.0));
     // Registered before the row's own widgets so the transfer button stays clickable on top.
-    let row = ui.interact(row_rect, ui.id().with(("entry_row", &entry.path)), Sense::click());
+    let mut row = ui.interact(
+        row_rect,
+        ui.id().with(("entry_row", idx, &entry.name, &entry.path)),
+        Sense::click(),
+    );
     if row.contains_pointer() {
         ui.painter()
             .rect_filled(row_rect, CornerRadius::same(6), c::SURFACE_2);
@@ -799,8 +898,12 @@ fn entry_row(ui: &mut egui::Ui, entry: &FileEntry, transfer_label: &str) -> RowA
         if row.clicked() {
             act = RowAction::Open;
         }
-        row.on_hover_cursor(CursorIcon::PointingHand);
+        row = row.on_hover_cursor(CursorIcon::PointingHand);
+        if is_root_view && is_root_shortcut_name(&entry.name) {
+            row.on_hover_text(&entry.path);
+        }
     }
+    let icon = classify_entry_icon(entry, is_root_view);
     ui.horizontal(|ui| {
         ui.set_height(28.0);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -813,7 +916,7 @@ fn entry_row(ui: &mut egui::Ui, entry: &FileEntry, transfer_label: &str) -> RowA
             }
             ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                 ui.add_space(6.0);
-                paint_entry_icon(ui, entry.is_dir);
+                paint_entry_icon(ui, icon);
                 ui.add_space(4.0);
                 let color = if entry.is_dir { c::TEXT } else { c::TEXT_2 };
                 ui.add(
@@ -827,40 +930,357 @@ fn entry_row(ui: &mut egui::Ui, entry: &FileEntry, transfer_label: &str) -> RowA
     act
 }
 
-/// Small painted folder / document icon (emoji glyphs render tiny and skewed at this size).
-fn paint_entry_icon(ui: &mut egui::Ui, is_dir: bool) {
+/// Small painted vector icon (emoji glyphs render tiny and skewed at this size).
+fn paint_entry_icon(ui: &mut egui::Ui, icon: EntryIcon) {
     let (rect, _) = ui.allocate_exact_size(vec2(18.0, 16.0), Sense::hover());
     let p = ui.painter();
     let (l, t) = (rect.left() + 1.0, rect.top() + 1.0);
-    if is_dir {
-        let fill = Color32::from_rgb(226, 182, 92);
-        p.rect_filled(
-            Rect::from_min_max(pos2(l, t + 1.0), pos2(l + 7.0, t + 5.0)),
-            CornerRadius::same(2),
-            fill,
-        );
-        p.rect_filled(
-            Rect::from_min_max(pos2(l, t + 3.0), pos2(l + 16.0, t + 14.0)),
-            CornerRadius::same(2),
-            fill,
-        );
-        p.line_segment(
-            [pos2(l + 1.0, t + 5.5), pos2(l + 15.0, t + 5.5)],
-            Stroke::new(1.0_f32, Color32::from_rgb(190, 146, 64)),
-        );
-    } else {
-        let stroke = Stroke::new(1.2_f32, c::TEXT_3);
-        p.rect_stroke(
-            Rect::from_min_max(pos2(l + 2.0, t), pos2(l + 14.0, t + 14.0)),
-            CornerRadius::same(2),
-            stroke,
-            egui::StrokeKind::Inside,
-        );
-        for i in 0..3 {
-            let y = t + 4.5 + i as f32 * 3.0;
-            p.line_segment([pos2(l + 5.0, y), pos2(l + 11.0, y)], Stroke::new(1.0_f32, c::TEXT_3));
+    match icon {
+        EntryIcon::Computer => {
+            let frame_c = Color32::from_rgb(96, 178, 245);
+            let screen_c = Color32::from_rgb(44, 118, 188);
+            p.rect_filled(
+                Rect::from_min_max(pos2(l + 1.5, t + 1.5), pos2(l + 14.5, t + 10.5)),
+                CornerRadius::same(1),
+                screen_c,
+            );
+            p.rect_stroke(
+                Rect::from_min_max(pos2(l + 1.0, t + 1.0), pos2(l + 15.0, t + 11.0)),
+                CornerRadius::same(2),
+                Stroke::new(1.3_f32, frame_c),
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [pos2(l + 8.0, t + 11.0), pos2(l + 8.0, t + 13.5)],
+                Stroke::new(1.5_f32, frame_c),
+            );
+            p.line_segment(
+                [pos2(l + 4.5, t + 13.8), pos2(l + 11.5, t + 13.8)],
+                Stroke::new(1.5_f32, frame_c),
+            );
+        }
+        EntryIcon::Desktop => {
+            let accent = Color32::from_rgb(76, 172, 248);
+            let screen = Color32::from_rgb(38, 98, 162);
+            p.rect_filled(
+                Rect::from_min_max(pos2(l + 1.5, t + 1.5), pos2(l + 14.5, t + 10.5)),
+                CornerRadius::same(1),
+                screen,
+            );
+            p.rect_filled(
+                Rect::from_min_max(pos2(l + 2.0, t + 8.5), pos2(l + 14.0, t + 10.3)),
+                CornerRadius::ZERO,
+                accent.gamma_multiply(0.7),
+            );
+            p.rect_stroke(
+                Rect::from_min_max(pos2(l + 1.0, t + 1.0), pos2(l + 15.0, t + 11.0)),
+                CornerRadius::same(2),
+                Stroke::new(1.3_f32, accent),
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [pos2(l + 5.0, t + 13.8), pos2(l + 11.0, t + 13.8)],
+                Stroke::new(1.5_f32, accent),
+            );
+        }
+        EntryIcon::Documents => {
+            let edge = Color32::from_rgb(176, 196, 222);
+            let line = Color32::from_rgb(122, 148, 180);
+            p.rect_stroke(
+                Rect::from_min_max(pos2(l + 2.0, t + 0.5), pos2(l + 14.0, t + 14.0)),
+                CornerRadius::same(2),
+                Stroke::new(1.3_f32, edge),
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [pos2(l + 10.0, t + 0.8), pos2(l + 13.6, t + 4.4)],
+                Stroke::new(1.1_f32, edge),
+            );
+            for i in 0..3 {
+                let y = t + 5.2 + i as f32 * 2.8;
+                p.line_segment([pos2(l + 4.8, y), pos2(l + 11.2, y)], Stroke::new(1.2_f32, line));
+            }
+        }
+        EntryIcon::Downloads => {
+            let green = Color32::from_rgb(66, 206, 146);
+            p.line_segment(
+                [pos2(l + 8.0, t + 1.5), pos2(l + 8.0, t + 10.2)],
+                Stroke::new(2.0_f32, green),
+            );
+            p.line(
+                vec![
+                    pos2(l + 4.2, t + 6.8),
+                    pos2(l + 8.0, t + 10.6),
+                    pos2(l + 11.8, t + 6.8),
+                ],
+                Stroke::new(1.8_f32, green),
+            );
+            p.line_segment(
+                [pos2(l + 2.5, t + 13.5), pos2(l + 13.5, t + 13.5)],
+                Stroke::new(1.6_f32, green),
+            );
+        }
+        EntryIcon::Drive => {
+            let body = Color32::from_rgb(152, 166, 186);
+            p.rect_filled(
+                Rect::from_min_max(pos2(l + 1.0, t + 4.0), pos2(l + 15.0, t + 12.5)),
+                CornerRadius::same(2),
+                Color32::from_rgb(56, 65, 80),
+            );
+            p.rect_stroke(
+                Rect::from_min_max(pos2(l + 1.0, t + 4.0), pos2(l + 15.0, t + 12.5)),
+                CornerRadius::same(2),
+                Stroke::new(1.3_f32, body),
+                egui::StrokeKind::Inside,
+            );
+            p.line_segment(
+                [pos2(l + 2.5, t + 9.2), pos2(l + 13.5, t + 9.2)],
+                Stroke::new(1.0_f32, Color32::from_rgb(96, 108, 126)),
+            );
+            p.circle_filled(pos2(l + 12.2, t + 10.9), 1.3, c::ACCENT);
+        }
+        EntryIcon::Folder => {
+            let fill = Color32::from_rgb(226, 182, 92);
+            p.rect_filled(
+                Rect::from_min_max(pos2(l, t + 1.0), pos2(l + 7.0, t + 5.0)),
+                CornerRadius::same(2),
+                fill,
+            );
+            p.rect_filled(
+                Rect::from_min_max(pos2(l, t + 3.0), pos2(l + 16.0, t + 14.0)),
+                CornerRadius::same(2),
+                fill,
+            );
+            p.line_segment(
+                [pos2(l + 1.0, t + 5.5), pos2(l + 15.0, t + 5.5)],
+                Stroke::new(1.0_f32, Color32::from_rgb(190, 146, 64)),
+            );
+        }
+        EntryIcon::File => {
+            let stroke = Stroke::new(1.2_f32, c::TEXT_3);
+            p.rect_stroke(
+                Rect::from_min_max(pos2(l + 2.0, t), pos2(l + 14.0, t + 14.0)),
+                CornerRadius::same(2),
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            for i in 0..3 {
+                let y = t + 4.5 + i as f32 * 3.0;
+                p.line_segment([pos2(l + 5.0, y), pos2(l + 11.0, y)], Stroke::new(1.0_f32, c::TEXT_3));
+            }
         }
     }
+}
+
+fn shortcut_chevron_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(28.0, 32.0), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let hovered = resp.hovered();
+        let fill = if open {
+            c::SURFACE_3
+        } else if hovered {
+            c::SURFACE_3
+        } else {
+            c::SURFACE_2
+        };
+        let stroke_c = if open {
+            c::ACCENT
+        } else if hovered {
+            Color32::from_rgb(74, 86, 106)
+        } else {
+            c::BORDER_STRONG
+        };
+        ui.painter().rect(
+            rect,
+            CornerRadius::same(theme::RADIUS),
+            fill,
+            Stroke::new(1.0_f32, stroke_c),
+            egui::StrokeKind::Inside,
+        );
+        let ctr = rect.center();
+        let dir = if open { -1.0 } else { 1.0 };
+        let fg = if open || hovered { c::TEXT } else { c::TEXT_2 };
+        ui.painter().line(
+            vec![
+                pos2(ctr.x - 4.0, ctr.y - 2.0 * dir),
+                pos2(ctr.x, ctr.y + 2.0 * dir),
+                pos2(ctr.x + 4.0, ctr.y - 2.0 * dir),
+            ],
+            Stroke::new(1.6_f32, fg),
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+fn shortcut_menu_item(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    icon: EntryIcon,
+    label: &str,
+    hover_path: Option<&str>,
+    active: bool,
+) -> bool {
+    let row_rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 28.0));
+    let mut row = ui.interact(row_rect, id, Sense::click());
+    if let Some(tip) = hover_path {
+        row = row.on_hover_text(tip);
+    }
+    let fill = if active {
+        Some(c::ACCENT_SOFT)
+    } else if row.contains_pointer() {
+        Some(c::SURFACE_2)
+    } else {
+        None
+    };
+    if let Some(bg) = fill {
+        ui.painter().rect_filled(row_rect, CornerRadius::same(6), bg);
+    }
+    let clicked = row.on_hover_cursor(CursorIcon::PointingHand).clicked();
+    ui.horizontal(|ui| {
+        ui.set_height(28.0);
+        ui.add_space(6.0);
+        paint_entry_icon(ui, icon);
+        ui.add_space(2.0);
+        let text_color = if active { c::ACCENT_HOVER } else { c::TEXT };
+        ui.add(
+            egui::Label::new(RichText::new(label).size(13.0).color(text_color))
+                .truncate()
+                .selectable(false),
+        );
+    });
+    clicked
+}
+
+/// Address bar with Sunlogin-style quick-location dropdown (此电脑 / 桌面 / 文档 / 下载 / 盘符).
+fn path_bar_with_shortcuts(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    path_input: &mut String,
+    current_dir: &str,
+    roots: &[FileEntry],
+    loading_roots: bool,
+) -> Option<String> {
+    let mut navigate_to = None;
+    let popup_id = ui.make_persistent_id((id_salt, "shortcuts_popup"));
+    let popup_open = ui.memory(|m| m.is_popup_open(popup_id));
+
+    let (anchor_resp, btn_resp, enter_or_go) = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let input_w = (ui.available_width() - 96.0).max(60.0);
+            let input_resp =
+                theme::text_input(ui, path_input, input_w, "此电脑（输入路径或点右侧▾）");
+            let btn_resp = shortcut_chevron_button(ui, popup_open)
+                .on_hover_text("快捷位置（此电脑 / 桌面 / 文档 / 下载 / 盘符）");
+            let enter = input_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let go = theme::small_button(ui, "前往", Kind::Secondary).clicked();
+            if (input_resp.clicked() || input_resp.gained_focus()) && popup_open {
+                ui.memory_mut(|m| m.close_popup());
+            }
+            (input_resp.union(btn_resp.clone()), btn_resp, enter || go)
+        })
+        .inner;
+
+    if btn_resp.clicked() {
+        ui.memory_mut(|m| m.toggle_popup(popup_id));
+    }
+    if enter_or_go {
+        if popup_open {
+            ui.memory_mut(|m| m.close_popup());
+        }
+        navigate_to = Some(path_input.clone());
+    }
+
+    let popup_w = anchor_resp.rect.width().clamp(210.0, 320.0);
+    let space_below = (ui.ctx().screen_rect().bottom() - anchor_resp.rect.bottom() - 20.0).max(80.0);
+    let menu_max_h = space_below.min(320.0);
+    let mut picked: Option<String> = None;
+    egui::popup_below_widget(
+        ui,
+        popup_id,
+        &anchor_resp,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        |ui| {
+            ui.set_width(popup_w);
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt((id_salt, "shortcut_scroll"))
+                    .max_height(menu_max_h)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        if shortcut_menu_item(
+                            ui,
+                            ui.id().with(("computer", 0usize)),
+                            EntryIcon::Computer,
+                            "此电脑",
+                            None,
+                            current_dir.trim().is_empty(),
+                        ) {
+                            picked = Some(String::new());
+                        }
+
+                        let quick_folders: Vec<&FileEntry> =
+                            roots.iter().filter(|e| is_quick_folder_entry(e)).collect();
+                        let drives: Vec<&FileEntry> =
+                            roots.iter().filter(|e| !is_quick_folder_entry(e)).collect();
+
+                        if !quick_folders.is_empty() {
+                            theme::divider(ui);
+                            for (idx, entry) in quick_folders.into_iter().enumerate() {
+                                let icon = classify_entry_icon(entry, true);
+                                let active = paths_equal_ci(current_dir, &entry.path);
+                                if shortcut_menu_item(
+                                    ui,
+                                    ui.id().with(("quick", idx, &entry.name, &entry.path)),
+                                    icon,
+                                    &entry.name,
+                                    Some(entry.path.as_str()),
+                                    active,
+                                ) {
+                                    picked = Some(entry.path.clone());
+                                }
+                            }
+                        }
+
+                        if !drives.is_empty() {
+                            theme::divider(ui);
+                            for (idx, entry) in drives.into_iter().enumerate() {
+                                let active = paths_equal_ci(current_dir, &entry.path);
+                                if shortcut_menu_item(
+                                    ui,
+                                    ui.id().with(("drive", idx, &entry.name, &entry.path)),
+                                    EntryIcon::Drive,
+                                    &entry.name,
+                                    Some(entry.path.as_str()),
+                                    active,
+                                ) {
+                                    picked = Some(entry.path.clone());
+                                }
+                            }
+                        }
+
+                        if roots.is_empty() {
+                            theme::divider(ui);
+                            let note = if loading_roots {
+                                "正在读取快捷位置…"
+                            } else {
+                                "点击「此电脑」刷新快捷位置"
+                            };
+                            ui.add_space(2.0);
+                            ui.label(theme::faint(note));
+                        }
+                    });
+            });
+        },
+    );
+
+    if let Some(target) = picked {
+        *path_input = target.clone();
+        ui.memory_mut(|m| m.close_popup());
+        navigate_to = Some(target);
+    }
+
+    navigate_to
 }
 
 fn pane_frame() -> Frame {
@@ -886,30 +1306,33 @@ fn local_pane(
                     state.refresh_local_dir();
                 }
                 if theme::small_button(ui, "上级", Kind::Ghost).clicked() {
-                    if let Some(parent) = Path::new(&state.local_dir).parent() {
-                        state.local_dir = parent.to_string_lossy().into_owned();
-                    } else {
-                        state.local_dir.clear();
-                    }
-                    state.refresh_local_dir();
+                    let next = Path::new(state.local_dir.trim())
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    state.navigate_local_dir(next);
                 }
-                if theme::small_button(ui, "盘符", Kind::Ghost).clicked() {
-                    state.local_dir.clear();
-                    state.refresh_local_dir();
+                if theme::small_button(ui, "此电脑", Kind::Ghost).clicked() {
+                    state.navigate_local_dir(String::new());
                 }
             });
         });
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - 62.0).max(80.0);
-            let resp = theme::text_input(ui, &mut state.local_dir, w, "本地路径，留空显示盘符");
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if theme::small_button(ui, "前往", Kind::Secondary).clicked() || enter {
-                state.refresh_local_dir();
-            }
-        });
+        let cur_local_dir = state.local_dir.clone();
+        let local_roots = state.local_roots.clone();
+        if let Some(target) = path_bar_with_shortcuts(
+            ui,
+            "local_path_bar",
+            &mut state.local_dir_input,
+            &cur_local_dir,
+            &local_roots,
+            false,
+        ) {
+            state.navigate_local_dir(target);
+        }
         if let Some(err) = &state.local_error {
             ui.label(RichText::new(err).size(12.5).color(c::DANGER));
         }
+        let is_root = state.local_dir.trim().is_empty();
         let entries = state.local_entries.clone();
         let cur_remote_dir = session.file_client.remote_dir.lock().unwrap().clone();
         egui::ScrollArea::vertical()
@@ -921,11 +1344,10 @@ fn local_pane(
                 if entries.is_empty() {
                     ui.label(theme::faint("（空）"));
                 }
-                for entry in entries {
-                    match entry_row(ui, &entry, "上传 →") {
+                for (idx, entry) in entries.iter().enumerate() {
+                    match entry_row(ui, idx, entry, "上传 →", is_root) {
                         RowAction::Open => {
-                            state.local_dir = entry.path.clone();
-                            state.refresh_local_dir();
+                            state.navigate_local_dir(entry.path.clone());
                         }
                         RowAction::Transfer => {
                             session.file_client.send(FileCommand::UploadFile {
@@ -948,45 +1370,52 @@ fn remote_pane(
 ) {
     pane_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
+        let cur_remote_dir = session.file_client.remote_dir.lock().unwrap().clone();
         ui.horizontal(|ui| {
             ui.label(theme::bold("远程电脑").size(14.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if theme::small_button(ui, "刷新", Kind::Ghost).clicked() {
+                    state.remote_dir_input = cur_remote_dir.clone();
                     session
                         .file_client
-                        .send(FileCommand::ListRemoteDir(state.remote_dir_input.clone()));
+                        .send(FileCommand::ListRemoteDir(cur_remote_dir.clone()));
                 }
                 if theme::small_button(ui, "上级", Kind::Ghost).clicked() {
-                    let next = Path::new(state.remote_dir_input.trim())
+                    let next = Path::new(cur_remote_dir.trim())
                         .parent()
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     session.file_client.send(FileCommand::ListRemoteDir(next));
                 }
-                if theme::small_button(ui, "盘符", Kind::Ghost).clicked() {
+                if theme::small_button(ui, "此电脑", Kind::Ghost).clicked() {
+                    if cur_remote_dir.trim().is_empty() {
+                        state.remote_dir_input.clear();
+                    }
                     session
                         .file_client
                         .send(FileCommand::ListRemoteDir(String::new()));
                 }
             });
         });
-        ui.horizontal(|ui| {
-            let w = (ui.available_width() - 62.0).max(80.0);
-            let resp =
-                theme::text_input(ui, &mut state.remote_dir_input, w, "远程路径，留空显示盘符");
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            if theme::small_button(ui, "前往", Kind::Secondary).clicked() || enter {
-                session
-                    .file_client
-                    .send(FileCommand::ListRemoteDir(state.remote_dir_input.clone()));
-            }
-        });
-
-        if session
+        let remote_roots = session.file_client.remote_roots.lock().unwrap().clone();
+        let remote_loading = session
             .file_client
             .remote_loading
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if let Some(target) = path_bar_with_shortcuts(
+            ui,
+            "remote_path_bar",
+            &mut state.remote_dir_input,
+            &cur_remote_dir,
+            &remote_roots,
+            remote_loading,
+        ) {
+            session
+                .file_client
+                .send(FileCommand::ListRemoteDir(target));
+        }
+
+        if remote_loading {
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new().size(14.0).color(c::ACCENT));
                 ui.label(theme::faint("正在读取远程目录…"));
@@ -996,12 +1425,8 @@ fn remote_pane(
             ui.label(RichText::new(err).size(12.5).color(c::DANGER));
         }
 
+        let is_root = cur_remote_dir.trim().is_empty();
         let r_entries = session.file_client.remote_entries.lock().unwrap().clone();
-        let local_target_dir = if state.local_dir.trim().is_empty() {
-            crate::transfer::default_receive_dir()
-        } else {
-            PathBuf::from(&state.local_dir)
-        };
         egui::ScrollArea::vertical()
             .id_salt("remote_entries")
             .max_height(list_h)
@@ -1011,17 +1436,22 @@ fn remote_pane(
                 if r_entries.is_empty() {
                     ui.label(theme::faint("（空）"));
                 }
-                for entry in r_entries {
-                    match entry_row(ui, &entry, "← 下载") {
+                for (idx, entry) in r_entries.iter().enumerate() {
+                    match entry_row(ui, idx, entry, "← 下载", is_root) {
                         RowAction::Open => {
                             session
                                 .file_client
                                 .send(FileCommand::ListRemoteDir(entry.path.clone()));
                         }
                         RowAction::Transfer => {
+                            let local_target_dir = if state.local_dir.trim().is_empty() {
+                                crate::transfer::default_receive_dir()
+                            } else {
+                                PathBuf::from(&state.local_dir)
+                            };
                             session.file_client.send(FileCommand::DownloadFile {
                                 remote_path: entry.path.clone(),
-                                local_dir: local_target_dir.clone(),
+                                local_dir: local_target_dir,
                             });
                         }
                         RowAction::None => {}
@@ -2014,5 +2444,202 @@ mod tests {
         let mut out = Vec::new();
         f.end_frame(CTRL, false, &|vk| vk == VK_V, &mut out);
         assert_eq!(out.len(), 1, "only the Ctrl sync, no V press: {out:?}");
+    }
+
+    fn test_entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
+        FileEntry {
+            name: name.into(),
+            path: path.into(),
+            is_dir,
+            size: 0,
+            modified_unix: 0,
+        }
+    }
+
+    #[test]
+    fn icon_classification_distinguishes_root_shortcuts_from_normal_folders() {
+        let desktop = test_entry("桌面", r"C:\Users\alice\Desktop", true);
+        let docs = test_entry("文档", r"C:\Users\alice\Documents", true);
+        let dl = test_entry("下载", r"C:\Users\alice\Downloads", true);
+        let redirected_dl = test_entry("下载", r"D:\", true);
+        let drive = test_entry("娱乐 (D:)", r"D:\", true);
+        let file = test_entry("notes.txt", r"D:\notes.txt", false);
+
+        assert_eq!(classify_entry_icon(&desktop, true), EntryIcon::Desktop);
+        assert_eq!(classify_entry_icon(&docs, true), EntryIcon::Documents);
+        assert_eq!(classify_entry_icon(&dl, true), EntryIcon::Downloads);
+        // Even when redirected to a drive root, the root shortcut keeps its shortcut icon & group.
+        assert_eq!(
+            classify_entry_icon(&redirected_dl, true),
+            EntryIcon::Downloads
+        );
+        assert!(is_quick_folder_entry(&redirected_dl));
+        assert!(!is_quick_folder_entry(&drive));
+        assert_eq!(classify_entry_icon(&drive, true), EntryIcon::Drive);
+        assert_eq!(classify_entry_icon(&file, true), EntryIcon::File);
+
+        // Inside a normal subdirectory, a folder literally named "桌面" stays a normal folder.
+        let sub_desktop = test_entry("桌面", r"D:\backup\桌面", true);
+        assert_eq!(classify_entry_icon(&sub_desktop, false), EntryIcon::Folder);
+        assert_eq!(classify_entry_icon(&drive, false), EntryIcon::Drive);
+    }
+
+    #[test]
+    fn local_dir_draft_input_does_not_corrupt_active_dir() {
+        let mut st = RemoteViewState::new(60, 4000, 0, None);
+        st.refresh_local_dir();
+        assert!(st.local_dir.is_empty());
+        assert!(!st.local_roots.is_empty());
+
+        let desktop = st
+            .local_roots
+            .iter()
+            .find(|e| e.name == "桌面")
+            .expect("desktop root missing")
+            .path
+            .clone();
+        st.navigate_local_dir(desktop.clone());
+        assert_eq!(st.local_dir, desktop);
+        assert_eq!(st.local_dir_input, desktop);
+        assert!(st.local_error.is_none());
+
+        // Typing an uncommitted draft leaves active local_dir intact.
+        st.local_dir_input = String::new();
+        assert_eq!(st.local_dir, desktop);
+
+        // Navigating to an invalid path preserves the active directory and entries.
+        let prev_entries = st.local_entries.clone();
+        let bad = r"Z:\__definitely_missing_flashdesk_dir__".to_string();
+        st.navigate_local_dir(bad.clone());
+        assert_eq!(st.local_dir, desktop);
+        assert_eq!(st.local_dir_input, bad);
+        assert_eq!(st.local_entries, prev_entries);
+        assert!(st.local_error.is_some());
+    }
+
+    #[test]
+    fn paths_equal_ci_matches_windows_paths() {
+        assert!(paths_equal_ci(r"C:\Users\Alice\Desktop", r"c:/users/alice/desktop\"));
+        assert!(paths_equal_ci(r"D:", r"d:\"));
+        assert!(!paths_equal_ci("", r"C:\"));
+        assert!(!paths_equal_ci(r"C:\Users\Alice", r"D:\Users\Alice"));
+    }
+
+    #[test]
+    fn shortcut_dropdown_renders_cleanly_at_desktop_and_min_window() {
+        // Include a redirected "下载" pointing to D:\ alongside "娱乐 (D:)" to verify zero ID collision.
+        let roots = vec![
+            test_entry("桌面", r"C:\Users\alice\Desktop", true),
+            test_entry("文档", r"C:\Users\alice\Documents", true),
+            test_entry("下载", r"D:\", true),
+            test_entry("本地磁盘 (C:)", r"C:\", true),
+            test_entry("娱乐 (D:)", r"D:\", true),
+            test_entry("软件 (E:)", r"E:\", true),
+            test_entry("文件 (F:)", r"F:\", true),
+        ];
+
+        for (w, h) in [(960.0_f32, 640.0_f32), (640.0_f32, 440.0_f32)] {
+            let ctx = egui::Context::default();
+            theme::install(&ctx);
+            let mut path_input = r"D:\".to_string();
+            let cur_dir = path_input.clone();
+
+            let mut captured_pid = None;
+            let mut anchor_bottom = 0.0_f32;
+            let mut last_navigated = None;
+
+            for pass in 0..3 {
+                let mut events = Vec::new();
+                if pass == 2 {
+                    let pid = captured_pid.expect("popup id missing");
+                    let popup_rect = ctx
+                        .memory(|m| m.area_rect(pid))
+                        .expect("popup area_rect missing after render");
+                    assert!(
+                        popup_rect.bottom() <= h + 1.0,
+                        "popup exceeded screen bottom at {w}x{h}: {} > {h}",
+                        popup_rect.bottom()
+                    );
+                    assert!(
+                        popup_rect.top() >= anchor_bottom - 2.0,
+                        "popup pushed up over toggle button at {w}x{h}: {} < {anchor_bottom}",
+                        popup_rect.top()
+                    );
+                    let click_pos = pos2(popup_rect.left() + 40.0, popup_rect.top() + 22.0);
+                    events.push(Event::PointerMoved(click_pos));
+                    events.push(Event::PointerButton {
+                        pos: click_pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Modifiers::NONE,
+                    });
+                    events.push(Event::PointerButton {
+                        pos: click_pos,
+                        button: PointerButton::Primary,
+                        pressed: false,
+                        modifiers: Modifiers::NONE,
+                    });
+                }
+
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h))),
+                    events,
+                    ..Default::default()
+                };
+                let _ = ctx.run(raw, |ctx| {
+                    egui::Window::new("文件传输")
+                        .default_size(vec2(w - 24.0, h - 72.0))
+                        .show(ctx, |ui| {
+                            ui.columns(2, |cols| {
+                                for (idx, col) in cols.iter_mut().enumerate() {
+                                    let avail_w = col.available_width();
+                                    let resp = col.push_id(idx, |ui| {
+                                        let id_salt = if idx == 0 {
+                                            "local_path_bar"
+                                        } else {
+                                            "remote_path_bar"
+                                        };
+                                        let pid =
+                                            ui.make_persistent_id((id_salt, "shortcuts_popup"));
+                                        if pass == 0 && idx == 0 {
+                                            captured_pid = Some(pid);
+                                            ui.memory_mut(|m| m.open_popup(pid));
+                                        }
+                                        let nav = path_bar_with_shortcuts(
+                                            ui,
+                                            id_salt,
+                                            &mut path_input,
+                                            &cur_dir,
+                                            &roots,
+                                            false,
+                                        );
+                                        if idx == 0 && nav.is_some() {
+                                            last_navigated = nav;
+                                        }
+                                    });
+                                    if idx == 0 {
+                                        anchor_bottom = resp.response.rect.bottom();
+                                    }
+                                    assert!(
+                                        resp.response.rect.width() <= avail_w + 1.0,
+                                        "column {idx} overflowed at {w}x{h}: {} > {}",
+                                        resp.response.rect.width(),
+                                        avail_w
+                                    );
+                                }
+                            });
+                        });
+                });
+            }
+            assert_eq!(
+                last_navigated,
+                Some(String::new()),
+                "clicking first dropdown row ('此电脑') should navigate to root at {w}x{h}"
+            );
+            assert!(
+                !ctx.memory(|m| m.is_popup_open(captured_pid.unwrap())),
+                "popup should close after picking an item at {w}x{h}"
+            );
+        }
     }
 }

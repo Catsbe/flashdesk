@@ -54,6 +54,7 @@ pub struct FileClientHandle {
     pub cmd_tx: mpsc::UnboundedSender<FileCommand>,
     pub remote_dir: Arc<Mutex<String>>,
     pub remote_entries: Arc<Mutex<Vec<FileEntry>>>,
+    pub remote_roots: Arc<Mutex<Vec<FileEntry>>>,
     pub remote_error: Arc<Mutex<Option<String>>>,
     pub remote_loading: Arc<AtomicBool>,
     pub transfers: Arc<Mutex<Vec<TransferRecord>>>,
@@ -81,6 +82,7 @@ pub fn spawn_file_client(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<FileCommand>();
     let remote_dir = Arc::new(Mutex::new(String::new()));
     let remote_entries = Arc::new(Mutex::new(Vec::new()));
+    let remote_roots = Arc::new(Mutex::new(Vec::new()));
     let remote_error = Arc::new(Mutex::new(None));
     let remote_loading = Arc::new(AtomicBool::new(false));
     let transfers = Arc::new(Mutex::new(Vec::new()));
@@ -93,6 +95,7 @@ pub fn spawn_file_client(
         cmd_tx,
         remote_dir: Arc::clone(&remote_dir),
         remote_entries: Arc::clone(&remote_entries),
+        remote_roots: Arc::clone(&remote_roots),
         remote_error: Arc::clone(&remote_error),
         remote_loading: Arc::clone(&remote_loading),
         transfers: Arc::clone(&transfers),
@@ -161,6 +164,9 @@ pub fn spawn_file_client(
                             entries,
                             error,
                         }) => {
+                            if p.trim().is_empty() && error.is_none() {
+                                *remote_roots.lock().unwrap() = entries.clone();
+                            }
                             *remote_dir.lock().unwrap() = p;
                             *remote_entries.lock().unwrap() = entries;
                             *remote_error.lock().unwrap() = error;

@@ -192,7 +192,9 @@ async fn handle_upload_init(
         .unwrap_or_else(|| "uploaded_file.bin".into());
 
     let dir = if remote_dir.trim().is_empty() {
-        default_receive_dir()
+        tokio::task::spawn_blocking(default_receive_dir)
+            .await
+            .unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(remote_dir.trim())
     };
