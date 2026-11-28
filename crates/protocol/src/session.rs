@@ -58,6 +58,13 @@ pub enum InputEvent {
         pressed: bool,
     },
     SendSas,
+    /// Syncs remote toggle-key states (Caps Lock / Num Lock / Scroll Lock) with the viewer.
+    /// Appended after `SendSas` so existing `InputEvent` indices (0..=4) never shift.
+    SyncLockKeys {
+        caps_lock: bool,
+        num_lock: bool,
+        scroll_lock: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,6 +218,69 @@ mod tests {
     fn variant_index(msg: &ControlMsg) -> u32 {
         let bytes = bincode::serialize(msg).unwrap();
         u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    fn input_variant_index(ev: &InputEvent) -> u32 {
+        let bytes = bincode::serialize(ev).unwrap();
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    #[test]
+    fn input_event_variant_indices_are_stable() {
+        assert_eq!(
+            input_variant_index(&InputEvent::MouseMove {
+                norm_x: 0.5,
+                norm_y: 0.5
+            }),
+            0
+        );
+        assert_eq!(
+            input_variant_index(&InputEvent::MouseButton {
+                button: MouseBtn::Left,
+                pressed: true
+            }),
+            1
+        );
+        assert_eq!(
+            input_variant_index(&InputEvent::MouseWheel {
+                delta_x: 0,
+                delta_y: 1
+            }),
+            2
+        );
+        assert_eq!(
+            input_variant_index(&InputEvent::Key {
+                vk: 0x41,
+                scan_code: 0x1E,
+                extended: false,
+                pressed: true
+            }),
+            3
+        );
+        assert_eq!(input_variant_index(&InputEvent::SendSas), 4);
+        assert_eq!(
+            input_variant_index(&InputEvent::SyncLockKeys {
+                caps_lock: true,
+                num_lock: false,
+                scroll_lock: true
+            }),
+            5
+        );
+
+        let wrapped = ControlMsg::Input(InputEvent::SyncLockKeys {
+            caps_lock: true,
+            num_lock: true,
+            scroll_lock: false,
+        });
+        let raw = bincode::serialize(&wrapped).unwrap();
+        assert!(matches!(
+            bincode::deserialize::<ControlMsg>(&raw).unwrap(),
+            ControlMsg::Input(InputEvent::SyncLockKeys {
+                caps_lock: true,
+                num_lock: true,
+                scroll_lock: false,
+            })
+        ));
     }
 
     /// Mixed-version sessions depend on existing variant indices never moving.

@@ -11,9 +11,16 @@ use eframe::egui::{
 use protocol::auth::RelayNodeConfig;
 use protocol::session::{InputEvent, MonitorInfo, MouseBtn, VddRequest};
 use protocol::transfer::FileEntry;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, PM_REMOVE,
+    WH_GETMESSAGE, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -41,6 +48,7 @@ pub struct RemoteViewState {
     res_cap_h: u32,
     last_norm_pos: Option<(f32, f32)>,
     keys: KeyForwarder,
+    special_key_hook: Option<SpecialKeyHookGuard>,
 
     // M2 + M3 interactive overlays
     clipboard_enabled: bool,
@@ -77,6 +85,7 @@ impl RemoteViewState {
             res_cap_h: initial_res_cap_h,
             last_norm_pos: None,
             keys: KeyForwarder::default(),
+            special_key_hook: None,
             clipboard_enabled: true,
             show_file_panel: false,
             file_panel_initialized: false,
@@ -143,6 +152,13 @@ pub fn render_remote_view(
     let mut action = RemoteViewAction::None;
     let mut go_back = false;
 
+    if state.special_key_hook.is_none() {
+        state.special_key_hook = SpecialKeyHookGuard::install_for_current_thread();
+    }
+    // Always drain once per frame so keys typed while disconnected, waiting, overlaid, or
+    // unfocused are discarded immediately instead of replaying once video resumes.
+    let hook_specials = take_captured_special_keys();
+
     if let Some(frame) = session.latest_frame.lock().unwrap().take() {
         // Already converted to egui's pixel format on the decode thread: just upload.
         let image: ColorImage = frame.image;
@@ -196,7 +212,17 @@ pub fn render_remote_view(
             if disp_size.x <= avail.width() + 0.5 && disp_size.y <= avail.height() + 0.5 {
                 let video_rect = Rect::from_center_size(avail.center(), disp_size);
                 let resp = ui.allocate_rect(video_rect, Sense::click_and_drag());
-                present_video(ctx, ui, state, session, tex_id, video_rect, &resp, alive);
+                present_video(
+                    ctx,
+                    ui,
+                    state,
+                    session,
+                    tex_id,
+                    video_rect,
+                    &resp,
+                    alive,
+                    &hook_specials,
+                );
             } else {
                 // 1:1 on a screen smaller than the remote desktop: pan with the scroll bars.
                 // The mouse wheel keeps going to the remote PC, so it must not also scroll here.
@@ -222,7 +248,17 @@ pub fn render_remote_view(
                             ui.id().with("remote_video"),
                             Sense::click_and_drag(),
                         );
-                        present_video(ctx, ui, state, session, tex_id, video_rect, &resp, alive);
+                        present_video(
+                            ctx,
+                            ui,
+                            state,
+                            session,
+                            tex_id,
+                            video_rect,
+                            &resp,
+                            alive,
+                            &hook_specials,
+                        );
                     });
             }
         });
@@ -479,6 +515,7 @@ fn present_video(
     video_rect: Rect,
     resp: &egui::Response,
     alive: bool,
+    special_keys: &[RawSpecialKey],
 ) {
     ui.painter().image(
         tex_id,
@@ -510,16 +547,23 @@ fn present_video(
         });
     }
     if overlays_open {
-        // Forwarding pauses: release the clipboard-shortcut keys and modifiers the host still
-        // holds, or they would stay stuck there and a stale record would swallow the next
-        // shortcut press. (Other keys held at this moment are not tracked.)
+        // Forwarding pauses: release the clipboard-shortcut keys, special keys, and modifiers the
+        // host still holds, or they would stay stuck there and a stale record would swallow the
+        // next shortcut press.
         let mut lifted = Vec::new();
         state.keys.release_all(&mut lifted);
         for ev in lifted {
             session.send(ViewerCommand::Input(ev));
         }
     } else {
-        forward_inputs(ctx, state, session, video_rect, pointer_in_video);
+        forward_inputs(
+            ctx,
+            state,
+            session,
+            video_rect,
+            pointer_in_video,
+            special_keys,
+        );
     }
 }
 
@@ -688,34 +732,141 @@ fn quality_menu(
     });
 }
 
-fn tools_menu(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSessionHandle) {
+const REMOTE_SYSTEM_COMBOS: &[(&str, &str, &[(u16, bool)])] = &[
+    ("Win", "向远程电脑发送开始菜单键 (Win)", &[(VK_LWIN, true)]),
+    (
+        "Win+D",
+        "向远程电脑发送显示桌面 (Win+D)",
+        &[(VK_LWIN, true), (VK_D, false)],
+    ),
+    (
+        "Win+E",
+        "向远程电脑打开文件资源管理器 (Win+E)",
+        &[(VK_LWIN, true), (VK_E, false)],
+    ),
+    (
+        "Win+R",
+        "向远程电脑打开运行框 (Win+R)",
+        &[(VK_LWIN, true), (VK_R, false)],
+    ),
+    (
+        "Alt+Tab",
+        "向远程电脑切换窗口 (Alt+Tab)",
+        &[(VK_LMENU, false), (VK_TAB, false)],
+    ),
+];
+
+fn remote_combo_events(keys: &[(u16, bool)]) -> Vec<InputEvent> {
+    let mut events = Vec::with_capacity(keys.len() * 2);
+    for &(vk, ext) in keys {
+        events.push(key_event(vk, ext, true));
+    }
+    for &(vk, ext) in keys.iter().rev() {
+        events.push(key_event(vk, ext, false));
+    }
+    events
+}
+
+fn send_remote_combo(
+    state: &mut RemoteViewState,
+    session: &ViewerSessionHandle,
+    keys: &[(u16, bool)],
+) {
+    let mut events = Vec::with_capacity(keys.len() * 2 + 4);
+    state.keys.combo_events(keys, &mut events);
+    for ev in events {
+        session.send(ViewerCommand::Input(ev));
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolsMenuAction {
+    None,
+    OpenVdd,
+    SendSas,
+    SendCombo(&'static [(u16, bool)]),
+}
+
+fn render_remote_system_combos(
+    ui: &mut egui::Ui,
+    mut on_pick: impl FnMut(&'static [(u16, bool)]),
+) {
+    ui.vertical(|ui| {
+        ui.label(theme::faint("发送系统快捷键"));
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
+            for &(label, tip, keys) in REMOTE_SYSTEM_COMBOS {
+                if theme::small_button(ui, label, Kind::Secondary)
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    on_pick(keys);
+                    ui.memory_mut(|mem| mem.close_popup());
+                }
+            }
+        });
+    });
+}
+
+fn render_tools_menu_body(
+    ui: &mut egui::Ui,
+    clipboard_enabled: &mut bool,
+    scale_mode: &mut ScaleMode,
+) -> (bool, ToolsMenuAction) {
+    let mut clipboard_changed = false;
+    let mut menu_action = ToolsMenuAction::None;
     egui::Grid::new("tools_grid")
         .num_columns(2)
         .spacing([14.0, 10.0])
         .show(ui, |ui| {
             ui.label(menu_label("剪贴板同步"));
-            if theme::toggle(ui, &mut state.clipboard_enabled).changed() {
-                session.send(ViewerCommand::SetClipboardEnabled(state.clipboard_enabled));
+            if theme::toggle(ui, clipboard_enabled).changed() {
+                clipboard_changed = true;
             }
             ui.end_row();
 
             ui.label(menu_label("画面缩放"));
             theme::segmented(
                 ui,
-                &mut state.scale_mode,
+                scale_mode,
                 &[(ScaleMode::Fit, "适应窗口"), (ScaleMode::Original, "1:1")],
             );
             ui.end_row();
         });
     theme::divider(ui);
     if theme::button(ui, "远程虚拟显示器…", Kind::Ghost).clicked() {
-        state.show_vdd_window = true;
-        session.send(ViewerCommand::VddAction(VddRequest::Query));
+        menu_action = ToolsMenuAction::OpenVdd;
         ui.memory_mut(|mem| mem.close_popup());
     }
     if theme::button(ui, "发送 Ctrl+Alt+Del", Kind::Ghost).clicked() {
-        session.send(ViewerCommand::Input(InputEvent::SendSas));
+        menu_action = ToolsMenuAction::SendSas;
         ui.memory_mut(|mem| mem.close_popup());
+    }
+    theme::divider(ui);
+    render_remote_system_combos(ui, |keys| {
+        menu_action = ToolsMenuAction::SendCombo(keys);
+    });
+    (clipboard_changed, menu_action)
+}
+
+fn tools_menu(ui: &mut egui::Ui, state: &mut RemoteViewState, session: &ViewerSessionHandle) {
+    let (clipboard_changed, menu_action) =
+        render_tools_menu_body(ui, &mut state.clipboard_enabled, &mut state.scale_mode);
+    if clipboard_changed {
+        session.send(ViewerCommand::SetClipboardEnabled(state.clipboard_enabled));
+    }
+    match menu_action {
+        ToolsMenuAction::None => {}
+        ToolsMenuAction::OpenVdd => {
+            state.show_vdd_window = true;
+            session.send(ViewerCommand::VddAction(VddRequest::Query));
+        }
+        ToolsMenuAction::SendSas => {
+            session.send(ViewerCommand::Input(InputEvent::SendSas));
+        }
+        ToolsMenuAction::SendCombo(keys) => {
+            send_remote_combo(state, session, keys);
+        }
     }
 }
 
@@ -1819,6 +1970,7 @@ fn forward_inputs(
     session: &ViewerSessionHandle,
     video_rect: Rect,
     pointer_in_video: bool,
+    special_keys: &[RawSpecialKey],
 ) {
     let mut events_to_send = Vec::new();
 
@@ -1854,9 +2006,14 @@ fn forward_inputs(
         // Win32 key state of this (UI) thread: in step with the key messages egui has processed.
         let key_down = |vk: u16| unsafe { GetKeyState(i32::from(vk)) } < 0;
         // ...and also physically held right now (the thread state can be stale after a focus
-        // change), for presses that are inferred without any event.
+        // change), for silent clipboard paste presses inferred without any key event.
         let held_now =
             |vk: u16| key_down(vk) && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
+        let lock_toggled = |vk: u16| (unsafe { GetKeyState(i32::from(vk)) } & 1) != 0;
+        // Sync lock-key states BEFORE forwarding any key presses from this frame.
+        state
+            .keys
+            .sync_locks(i.focused, &lock_toggled, &mut events_to_send);
         for (idx, ev) in i.events.iter().enumerate() {
             match ev {
                 Event::PointerButton {
@@ -1887,13 +2044,18 @@ fn forward_inputs(
                     &i.events[idx + 1..],
                     i.modifiers,
                     &key_down,
+                    &lock_toggled,
                     &mut events_to_send,
                 ),
             }
         }
-        state
-            .keys
-            .end_frame(i.modifiers, i.focused, &held_now, &mut events_to_send);
+        state.keys.end_frame(
+            i.modifiers,
+            i.focused,
+            &held_now,
+            special_keys,
+            &mut events_to_send,
+        );
     });
 
     for ev in events_to_send {
@@ -1901,15 +2063,172 @@ fn forward_inputs(
     }
 }
 
+const VK_CANCEL: u16 = 0x03;
 const VK_C: u16 = 0x43;
+const VK_D: u16 = 0x44;
+const VK_E: u16 = 0x45;
+const VK_R: u16 = 0x52;
 const VK_V: u16 = 0x56;
 const VK_X: u16 = 0x58;
+const VK_TAB: u16 = 0x09;
+const VK_PAUSE: u16 = 0x13;
+const VK_CAPITAL: u16 = 0x14;
+const VK_SNAPSHOT: u16 = 0x2C;
 const VK_INSERT: u16 = 0x2D;
 const VK_DELETE: u16 = 0x2E;
+const VK_LWIN: u16 = 0x5B;
+const VK_APPS: u16 = 0x5D;
+const VK_MULTIPLY: u16 = 0x6A;
+const VK_NUMLOCK: u16 = 0x90;
+const VK_SCROLL: u16 = 0x91;
 const VK_LSHIFT: u16 = 0xA0;
 const VK_LCONTROL: u16 = 0xA2;
 const VK_LMENU: u16 = 0xA4;
-const VK_LWIN: u16 = 0x5B;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawSpecialKey {
+    vk: u16,
+    scan_code: u16,
+    extended: bool,
+    pressed: bool,
+}
+
+fn is_hooked_special_vk(vk: u16) -> bool {
+    matches!(
+        vk,
+        VK_SNAPSHOT | VK_PAUSE | VK_CANCEL | VK_APPS | VK_MULTIPLY
+    )
+}
+
+fn special_key_extended(vk: u16) -> bool {
+    matches!(vk, VK_SNAPSHOT | VK_CANCEL | VK_APPS)
+}
+
+fn resolve_special_scan_code(vk: u16, msg_scan: u16) -> u16 {
+    match vk {
+        // PrintScreen must use extended 0x37 (MapVirtualKeyW(0x2C) returns 0x54 SysRq).
+        VK_SNAPSHOT => 0x37,
+        // Pause must use canonical 0x45 (MapVirtualKeyW(0x13) returns 0).
+        VK_PAUSE => 0x45,
+        VK_CANCEL => {
+            if msg_scan != 0 {
+                msg_scan
+            } else {
+                0x46
+            }
+        }
+        VK_APPS => {
+            if msg_scan != 0 {
+                msg_scan
+            } else {
+                0x5D
+            }
+        }
+        VK_MULTIPLY => {
+            if msg_scan != 0 {
+                msg_scan
+            } else {
+                0x37
+            }
+        }
+        _ => msg_scan,
+    }
+}
+
+fn scan_code_for_vk(vk: u16) -> u16 {
+    match vk {
+        VK_SNAPSHOT => 0x37,
+        VK_PAUSE => 0x45,
+        VK_CANCEL => 0x46,
+        _ => unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 },
+    }
+}
+
+thread_local! {
+    static SPECIAL_KEY_QUEUE: RefCell<Vec<RawSpecialKey>> = const { RefCell::new(Vec::new()) };
+}
+
+unsafe extern "system" fn special_key_hook_proc(
+    code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if code >= 0 && (wparam.0 as u32) == PM_REMOVE.0 && lparam.0 != 0 {
+        let msg = &*(lparam.0 as *const MSG);
+        if matches!(
+            msg.message,
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+        ) {
+            let vk = (msg.wParam.0 & 0xFFFF) as u16;
+            if is_hooked_special_vk(vk) {
+                let pressed = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
+                let msg_scan = (((msg.lParam.0 as usize) >> 16) & 0xFF) as u16;
+                let item = RawSpecialKey {
+                    vk,
+                    scan_code: resolve_special_scan_code(vk, msg_scan),
+                    extended: special_key_extended(vk),
+                    pressed,
+                };
+                SPECIAL_KEY_QUEUE.with(|cell| {
+                    if let Ok(mut q) = cell.try_borrow_mut() {
+                        if q.len() < 256 {
+                            q.push(item);
+                        }
+                    }
+                });
+            }
+        }
+    }
+    CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+}
+
+struct SpecialKeyHookGuard {
+    hhook: isize,
+    thread_id: u32,
+}
+
+impl SpecialKeyHookGuard {
+    fn install_for_current_thread() -> Option<Self> {
+        let tid = unsafe { GetCurrentThreadId() };
+        let hhook = unsafe {
+            SetWindowsHookExW(
+                WH_GETMESSAGE,
+                Some(special_key_hook_proc),
+                HINSTANCE::default(),
+                tid,
+            )
+        }
+        .ok()?;
+        Some(Self {
+            hhook: hhook.0 as isize,
+            thread_id: tid,
+        })
+    }
+}
+
+impl Drop for SpecialKeyHookGuard {
+    fn drop(&mut self) {
+        if self.hhook != 0 {
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(self.hhook as *mut _));
+            }
+        }
+        if unsafe { GetCurrentThreadId() } == self.thread_id {
+            SPECIAL_KEY_QUEUE.with(|cell| {
+                if let Ok(mut q) = cell.try_borrow_mut() {
+                    q.clear();
+                }
+            });
+        }
+    }
+}
+
+fn take_captured_special_keys() -> Vec<RawSpecialKey> {
+    SPECIAL_KEY_QUEUE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => Vec::new(),
+    })
+}
 
 /// Turns the viewer's egui keyboard events into remote key events.
 ///
@@ -1921,16 +2240,47 @@ const VK_LWIN: u16 = 0x5B;
 /// side (pitfall #21). Those key-downs are rebuilt here.
 ///
 /// Modifiers are synced from each key event's own modifier state, so a modifier pressed in the
-/// same frame as the key still reaches the host first.
+/// same frame as the key still reaches the host first. Lock keys (Caps/Num/Scroll Lock) are
+/// synced from Win32 key state, and keys absent from `egui::Key` (PrintScreen, Pause/Ctrl+Break,
+/// Apps, Numpad `*`) are captured by the UI-thread `WH_GETMESSAGE` hook.
 #[derive(Default)]
 struct KeyForwarder {
     /// Modifier state the host has been sent.
     sent_mods: Modifiers,
     /// Clipboard-shortcut keys (C, X, V, Insert, Delete) the host currently holds down.
     shortcut_down: Vec<u16>,
+    /// Special keys absent from `egui::Key` currently held down on the host.
+    special_down: Vec<(u16, u16, bool)>,
+    /// Last lock-key toggle states `(caps, num, scroll)` synced to the host while focused.
+    synced_locks: Option<(bool, bool, bool)>,
 }
 
 impl KeyForwarder {
+    fn sync_locks(
+        &mut self,
+        window_focused: bool,
+        lock_toggled: &dyn Fn(u16) -> bool,
+        out: &mut Vec<InputEvent>,
+    ) {
+        if !window_focused {
+            self.synced_locks = None;
+            return;
+        }
+        let cur = (
+            lock_toggled(VK_CAPITAL),
+            lock_toggled(VK_NUMLOCK),
+            lock_toggled(VK_SCROLL),
+        );
+        if self.synced_locks != Some(cur) {
+            self.synced_locks = Some(cur);
+            out.push(InputEvent::SyncLockKeys {
+                caps_lock: cur.0,
+                num_lock: cur.1,
+                scroll_lock: cur.2,
+            });
+        }
+    }
+
     /// Handles one keyboard-related event. `rest` holds the events after `ev` in this frame;
     /// `key_down(vk)` reads the Win32 key state of the UI thread.
     fn on_event(
@@ -1939,11 +2289,13 @@ impl KeyForwarder {
         rest: &[Event],
         frame_mods: Modifiers,
         key_down: &dyn Fn(u16) -> bool,
+        lock_toggled: &dyn Fn(u16) -> bool,
         out: &mut Vec<InputEvent>,
     ) {
         match ev {
             Event::Key {
                 key,
+                physical_key,
                 pressed,
                 modifiers,
                 ..
@@ -1952,7 +2304,7 @@ impl KeyForwarder {
                 if *key == Key::F11 {
                     return;
                 }
-                let Some((vk, ext)) = map_egui_key(*key) else {
+                let Some((vk, ext)) = map_egui_key(*key, *physical_key) else {
                     return;
                 };
                 self.sync_modifiers(*modifiers, out);
@@ -1986,8 +2338,11 @@ impl KeyForwarder {
                     .find(|vk| self.shortcut_down.contains(vk));
                 let released_later = rest.iter().find_map(|e| match e {
                     Event::Key {
-                        key, pressed: false, ..
-                    } => map_egui_key(*key)
+                        key,
+                        physical_key,
+                        pressed: false,
+                        ..
+                    } => map_egui_key(*key, *physical_key)
                         .map(|(vk, _)| vk)
                         .filter(|vk| candidates.contains(vk)),
                     _ => None,
@@ -2015,18 +2370,24 @@ impl KeyForwarder {
             }
             // winit already reports synthetic key-ups for held keys on focus loss; this catches
             // anything it missed so nothing stays down on the host.
-            Event::WindowFocused(false) => self.release_shortcut_keys(out),
+            Event::WindowFocused(false) => {
+                self.release_shortcut_keys(out);
+                self.synced_locks = None;
+            }
+            Event::WindowFocused(true) => {
+                self.sync_locks(true, lock_toggled, out);
+            }
             _ => {}
         }
     }
 
-    /// Runs after all events of a frame. `held_now(vk)`: the key is down both in the UI thread's
-    /// key state and physically right now.
+    /// Runs after all events of a frame. `held_now(vk)`: the key is down right now.
     fn end_frame(
         &mut self,
         frame_mods: Modifiers,
         window_focused: bool,
         held_now: &dyn Fn(u16) -> bool,
+        special_keys: &[RawSpecialKey],
         out: &mut Vec<InputEvent>,
     ) {
         self.sync_modifiers(frame_mods, out);
@@ -2045,17 +2406,64 @@ impl KeyForwarder {
                 out.push(key_event(vk, shortcut_key_extended(vk), true));
             }
         }
+        self.process_special_keys(special_keys, out);
+    }
+
+    fn process_special_keys(&mut self, special_keys: &[RawSpecialKey], out: &mut Vec<InputEvent>) {
+        for &sk in special_keys {
+            if !is_hooked_special_vk(sk.vk) {
+                continue;
+            }
+            let was_down = self.special_down.iter().any(|&(k, _, _)| k == sk.vk);
+            if sk.vk == VK_SNAPSHOT {
+                if sk.pressed {
+                    if !was_down {
+                        self.special_down.push((sk.vk, sk.scan_code, sk.extended));
+                        out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, true));
+                    }
+                } else if was_down {
+                    self.special_down.retain(|&(k, _, _)| k != sk.vk);
+                    out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, false));
+                } else {
+                    // Windows omits WM_KEYDOWN for PrintScreen and emits only WM_KEYUP.
+                    out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, true));
+                    out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, false));
+                }
+                continue;
+            }
+            if sk.pressed {
+                if !was_down {
+                    self.special_down.push((sk.vk, sk.scan_code, sk.extended));
+                    out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, true));
+                } else if sk.vk == VK_MULTIPLY {
+                    // Allow auto-repeat while Numpad `*` is held without duplicating release state.
+                    out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, true));
+                }
+            } else if was_down {
+                self.special_down.retain(|&(k, _, _)| k != sk.vk);
+                out.push(key_event_with_scan(sk.vk, sk.scan_code, sk.extended, false));
+            }
+        }
+    }
+
+    fn combo_events(&mut self, keys: &[(u16, bool)], out: &mut Vec<InputEvent>) {
+        self.sync_modifiers(Modifiers::NONE, out);
+        out.extend(remote_combo_events(keys));
     }
 
     /// Releases everything the host holds (forwarding is about to pause).
     fn release_all(&mut self, out: &mut Vec<InputEvent>) {
         self.release_shortcut_keys(out);
         self.sync_modifiers(Modifiers::NONE, out);
+        self.synced_locks = None;
     }
 
     fn release_shortcut_keys(&mut self, out: &mut Vec<InputEvent>) {
         for vk in std::mem::take(&mut self.shortcut_down) {
             out.push(key_event(vk, shortcut_key_extended(vk), false));
+        }
+        for (vk, scan_code, extended) in std::mem::take(&mut self.special_down) {
+            out.push(key_event_with_scan(vk, scan_code, extended, false));
         }
     }
 
@@ -2103,14 +2511,17 @@ fn egui_swallows_press(vk: u16, mods: Modifiers) -> bool {
     }
 }
 
-fn key_event(vk: u16, extended: bool, pressed: bool) -> InputEvent {
-    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC) as u16 };
+fn key_event_with_scan(vk: u16, scan_code: u16, extended: bool, pressed: bool) -> InputEvent {
     InputEvent::Key {
         vk,
         scan_code,
         extended,
         pressed,
     }
+}
+
+fn key_event(vk: u16, extended: bool, pressed: bool) -> InputEvent {
+    key_event_with_scan(vk, scan_code_for_vk(vk), extended, pressed)
 }
 
 fn map_pointer_btn(btn: PointerButton) -> MouseBtn {
@@ -2123,7 +2534,22 @@ fn map_pointer_btn(btn: PointerButton) -> MouseBtn {
     }
 }
 
-fn map_egui_key(key: Key) -> Option<(u16, bool)> {
+fn map_egui_key(key: Key, physical_key: Option<Key>) -> Option<(u16, bool)> {
+    if let Some(mapped) = map_key_variant(key, physical_key) {
+        return Some(mapped);
+    }
+    let pk = physical_key?;
+    if pk == Key::F11 {
+        return None;
+    }
+    let mapped = map_key_variant(pk, Some(pk))?;
+    if matches!(key, Key::Copy | Key::Cut | Key::Paste) && !is_shortcut_key(mapped.0) {
+        return None;
+    }
+    Some(mapped)
+}
+
+fn map_key_variant(key: Key, physical_key: Option<Key>) -> Option<(u16, bool)> {
     let pair = match key {
         Key::A => (0x41, false),
         Key::B => (0x42, false),
@@ -2152,7 +2578,7 @@ fn map_egui_key(key: Key) -> Option<(u16, bool)> {
         Key::Y => (0x59, false),
         Key::Z => (0x5A, false),
         Key::Num0 => (0x30, false),
-        Key::Num1 => (0x31, false),
+        Key::Num1 | Key::Exclamationmark => (0x31, false),
         Key::Num2 => (0x32, false),
         Key::Num3 => (0x33, false),
         Key::Num4 => (0x34, false),
@@ -2187,17 +2613,36 @@ fn map_egui_key(key: Key) -> Option<(u16, bool)> {
         Key::F9 => (0x78, false),
         Key::F10 => (0x79, false),
         Key::F12 => (0x7B, false),
+        Key::F13 => (0x7C, false),
+        Key::F14 => (0x7D, false),
+        Key::F15 => (0x7E, false),
+        Key::F16 => (0x7F, false),
+        Key::F17 => (0x80, false),
+        Key::F18 => (0x81, false),
+        Key::F19 => (0x82, false),
+        Key::F20 => (0x83, false),
+        Key::F21 => (0x84, false),
+        Key::F22 => (0x85, false),
+        Key::F23 => (0x86, false),
+        Key::F24 => (0x87, false),
         Key::Minus => (0xBD, false),
         Key::Equals => (0xBB, false),
-        Key::OpenBracket => (0xDB, false),
-        Key::CloseBracket => (0xDD, false),
-        Key::Backslash => (0xDC, false),
-        Key::Semicolon => (0xBA, false),
+        Key::Plus => {
+            if physical_key == Some(Key::Plus) {
+                (0x6B, false)
+            } else {
+                (0xBB, false)
+            }
+        }
+        Key::OpenBracket | Key::OpenCurlyBracket => (0xDB, false),
+        Key::CloseBracket | Key::CloseCurlyBracket => (0xDD, false),
+        Key::Backslash | Key::Pipe => (0xDC, false),
+        Key::Semicolon | Key::Colon => (0xBA, false),
         Key::Quote => (0xDE, false),
         Key::Backtick => (0xC0, false),
         Key::Comma => (0xBC, false),
         Key::Period => (0xBE, false),
-        Key::Slash => (0xBF, false),
+        Key::Slash | Key::Questionmark => (0xBF, false),
         _ => return None,
     };
     Some(pair)
@@ -2218,14 +2663,61 @@ mod tests {
     };
     const SHIFT: Modifiers = Modifiers::SHIFT;
 
-    fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+    fn key_phys(key: Key, physical_key: Option<Key>, pressed: bool, modifiers: Modifiers) -> Event {
         Event::Key {
             key,
-            physical_key: None,
+            physical_key,
             pressed,
             repeat: false,
             modifiers,
         }
+    }
+
+    fn key(key: Key, pressed: bool, modifiers: Modifiers) -> Event {
+        key_phys(key, None, pressed, modifiers)
+    }
+
+    fn frame_raw_special(
+        fwd: &mut KeyForwarder,
+        events: &[Event],
+        mods: Modifiers,
+        focused: bool,
+        down: &[u16],
+        locks: (bool, bool, bool),
+        special_keys: &[RawSpecialKey],
+    ) -> Vec<InputEvent> {
+        let key_down = |vk: u16| down.contains(&vk);
+        let lock_toggled = |vk: u16| match vk {
+            VK_CAPITAL => locks.0,
+            VK_NUMLOCK => locks.1,
+            VK_SCROLL => locks.2,
+            _ => false,
+        };
+        let mut out = Vec::new();
+        fwd.sync_locks(focused, &lock_toggled, &mut out);
+        for (idx, ev) in events.iter().enumerate() {
+            fwd.on_event(
+                ev,
+                &events[idx + 1..],
+                mods,
+                &key_down,
+                &lock_toggled,
+                &mut out,
+            );
+        }
+        fwd.end_frame(mods, focused, &key_down, special_keys, &mut out);
+        out
+    }
+
+    fn frame_raw(
+        fwd: &mut KeyForwarder,
+        events: &[Event],
+        mods: Modifiers,
+        focused: bool,
+        down: &[u16],
+        locks: (bool, bool, bool),
+    ) -> Vec<InputEvent> {
+        frame_raw_special(fwd, events, mods, focused, down, locks, &[])
     }
 
     /// Feeds one egui frame through the forwarder; returns `(vk, pressed)` pairs sent to the host.
@@ -2235,12 +2727,8 @@ mod tests {
         mods: Modifiers,
         down: &[u16],
     ) -> Vec<(u16, bool)> {
-        let key_down = |vk: u16| down.contains(&vk);
-        let mut out = Vec::new();
-        for (idx, ev) in events.iter().enumerate() {
-            fwd.on_event(ev, &events[idx + 1..], mods, &key_down, &mut out);
-        }
-        fwd.end_frame(mods, true, &key_down, &mut out);
+        fwd.synced_locks.get_or_insert((false, false, false));
+        let out = frame_raw(fwd, events, mods, true, down, (false, false, false));
         pairs(out)
     }
 
@@ -2389,7 +2877,7 @@ mod tests {
             [(VK_DELETE, true)]
         );
         let mut out = Vec::new();
-        f.on_event(&Event::Cut, &[], SHIFT, &|_| false, &mut out);
+        f.on_event(&Event::Cut, &[], SHIFT, &|_| false, &|_| false, &mut out);
         let InputEvent::Key { extended, .. } = out[0] else {
             panic!("expected a key event");
         };
@@ -2442,8 +2930,636 @@ mod tests {
     fn unfocused_window_does_not_poll_key_state() {
         let mut f = KeyForwarder::default();
         let mut out = Vec::new();
-        f.end_frame(CTRL, false, &|vk| vk == VK_V, &mut out);
+        f.end_frame(CTRL, false, &|vk| vk == VK_V, &[], &mut out);
         assert_eq!(out.len(), 1, "only the Ctrl sync, no V press: {out:?}");
+    }
+
+    #[test]
+    fn shifted_punctuation_numpad_plus_and_f13_to_f24_are_forwarded() {
+        let mut f = KeyForwarder::default();
+        // Shift+1 (!), even if Shift is released before 1, sends matching VK 0x31 down and up.
+        assert_eq!(
+            frame(
+                &mut f,
+                &[key_phys(Key::Exclamationmark, Some(Key::Num1), true, SHIFT)],
+                SHIFT,
+                &[]
+            ),
+            [(VK_LSHIFT, true), (0x31, true)]
+        );
+        assert_eq!(
+            frame(
+                &mut f,
+                &[key_phys(Key::Num1, Some(Key::Num1), false, NONE)],
+                NONE,
+                &[]
+            ),
+            [(VK_LSHIFT, false), (0x31, false)]
+        );
+
+        let shifted_syms = [
+            (Key::Colon, Key::Semicolon, 0xBA),
+            (Key::Pipe, Key::Backslash, 0xDC),
+            (Key::Questionmark, Key::Slash, 0xBF),
+            (Key::OpenCurlyBracket, Key::OpenBracket, 0xDB),
+            (Key::CloseCurlyBracket, Key::CloseBracket, 0xDD),
+            (Key::Plus, Key::Equals, 0xBB),
+        ];
+        for (logical, phys, expected_vk) in shifted_syms {
+            assert_eq!(
+                frame(
+                    &mut f,
+                    &[
+                        key_phys(logical, Some(phys), true, SHIFT),
+                        key_phys(logical, Some(phys), false, SHIFT),
+                    ],
+                    SHIFT,
+                    &[]
+                ),
+                [(VK_LSHIFT, true), (expected_vk, true), (expected_vk, false)]
+            );
+            assert_eq!(frame(&mut f, &[], NONE, &[]), [(VK_LSHIFT, false)]);
+        }
+
+        // Numpad '+' reports physical_key = Some(Key::Plus) and maps to VK_ADD (0x6B).
+        assert_eq!(
+            frame(
+                &mut f,
+                &[
+                    key_phys(Key::Plus, Some(Key::Plus), true, NONE),
+                    key_phys(Key::Plus, Some(Key::Plus), false, NONE),
+                ],
+                NONE,
+                &[]
+            ),
+            [(0x6B, true), (0x6B, false)]
+        );
+
+        // F13..F24 map cleanly to VK_F13..VK_F24 (0x7C..=0x87), while F11 stays local.
+        let fkeys = [
+            (Key::F13, 0x7C),
+            (Key::F14, 0x7D),
+            (Key::F15, 0x7E),
+            (Key::F16, 0x7F),
+            (Key::F17, 0x80),
+            (Key::F18, 0x81),
+            (Key::F19, 0x82),
+            (Key::F20, 0x83),
+            (Key::F21, 0x84),
+            (Key::F22, 0x85),
+            (Key::F23, 0x86),
+            (Key::F24, 0x87),
+        ];
+        for (k, expected_vk) in fkeys {
+            assert_eq!(
+                frame(&mut f, &[key(k, true, NONE)], NONE, &[]),
+                [(expected_vk, true)]
+            );
+        }
+        assert_eq!(frame(&mut f, &[key(Key::F11, true, NONE)], NONE, &[]), []);
+    }
+
+    #[test]
+    fn lock_keys_sync_before_typing_and_resync_after_focus_loss() {
+        let mut f = KeyForwarder::default();
+        // First focused frame with Caps Lock ON and Num Lock ON syncs locks BEFORE the key press.
+        let out = frame_raw(
+            &mut f,
+            &[key(Key::A, true, NONE)],
+            NONE,
+            true,
+            &[],
+            (true, true, false),
+        );
+        assert_eq!(
+            out[0],
+            InputEvent::SyncLockKeys {
+                caps_lock: true,
+                num_lock: true,
+                scroll_lock: false,
+            }
+        );
+        assert!(matches!(
+            out[1],
+            InputEvent::Key {
+                vk: 0x41,
+                pressed: true,
+                ..
+            }
+        ));
+
+        // Same lock state next frame emits no redundant SyncLockKeys.
+        let out2 = frame_raw(&mut f, &[], NONE, true, &[], (true, true, false));
+        assert!(out2.is_empty(), "expected no events, got {out2:?}");
+
+        // Toggling Caps Lock OFF syncs immediately.
+        let out3 = frame_raw(
+            &mut f,
+            &[key(Key::B, true, NONE)],
+            NONE,
+            true,
+            &[],
+            (false, true, false),
+        );
+        assert_eq!(
+            out3[0],
+            InputEvent::SyncLockKeys {
+                caps_lock: false,
+                num_lock: true,
+                scroll_lock: false,
+            }
+        );
+
+        // Focus loss clears cached lock state; refocusing re-syncs even if toggled outside window.
+        let _ = frame_raw(
+            &mut f,
+            &[Event::WindowFocused(false)],
+            NONE,
+            false,
+            &[],
+            (false, true, false),
+        );
+        let out4 = frame_raw(
+            &mut f,
+            &[Event::WindowFocused(true)],
+            NONE,
+            true,
+            &[],
+            (true, false, true),
+        );
+        assert_eq!(
+            out4,
+            vec![InputEvent::SyncLockKeys {
+                caps_lock: true,
+                num_lock: false,
+                scroll_lock: true,
+            }]
+        );
+    }
+
+    fn key_tuples(out: Vec<InputEvent>) -> Vec<(u16, u16, bool, bool)> {
+        out.into_iter()
+            .map(|e| match e {
+                InputEvent::Key {
+                    vk,
+                    scan_code,
+                    extended,
+                    pressed,
+                } => (vk, scan_code, extended, pressed),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn special_keys_forward_snapshot_tap_pause_cancel_and_release_on_blur() {
+        let mut f = KeyForwarder::default();
+        f.synced_locks = Some((false, false, false));
+
+        // 1. Windows PrintScreen omits WM_KEYDOWN and only fires WM_KEYUP: forward a full tap
+        //    with extended scan code 0x37 (never 0x54 SysRq).
+        let snap_up_only = RawSpecialKey {
+            vk: VK_SNAPSHOT,
+            scan_code: resolve_special_scan_code(VK_SNAPSHOT, 0x54),
+            extended: special_key_extended(VK_SNAPSHOT),
+            pressed: false,
+        };
+        assert_eq!(
+            key_tuples(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[snap_up_only],
+            )),
+            [
+                (VK_SNAPSHOT, 0x37, true, true),
+                (VK_SNAPSHOT, 0x37, true, false),
+            ]
+        );
+
+        // 2. If a driver DOES emit WM_KEYDOWN + WM_KEYUP for VK_SNAPSHOT, do not double-press.
+        let snap_down = RawSpecialKey {
+            pressed: true,
+            ..snap_up_only
+        };
+        assert_eq!(
+            key_tuples(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[snap_down, snap_up_only],
+            )),
+            [
+                (VK_SNAPSHOT, 0x37, true, true),
+                (VK_SNAPSHOT, 0x37, true, false),
+            ]
+        );
+
+        // 3. Rapid Pause make+break pulse in a single frame sends scan_code 0x45 cleanly.
+        let pause_down = RawSpecialKey {
+            vk: VK_PAUSE,
+            scan_code: resolve_special_scan_code(VK_PAUSE, 0),
+            extended: special_key_extended(VK_PAUSE),
+            pressed: true,
+        };
+        let pause_up = RawSpecialKey {
+            pressed: false,
+            ..pause_down
+        };
+        assert_eq!(
+            key_tuples(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[pause_down, pause_up],
+            )),
+            [(VK_PAUSE, 0x45, false, true), (VK_PAUSE, 0x45, false, false)]
+        );
+
+        // 4. Ctrl+Pause/Break emits VK_CANCEL (0x03, scan 0x46, extended=true) after syncing Ctrl.
+        let cancel_down = RawSpecialKey {
+            vk: VK_CANCEL,
+            scan_code: resolve_special_scan_code(VK_CANCEL, 0),
+            extended: special_key_extended(VK_CANCEL),
+            pressed: true,
+        };
+        let cancel_up = RawSpecialKey {
+            pressed: false,
+            ..cancel_down
+        };
+        assert_eq!(
+            pairs(frame_raw_special(
+                &mut f,
+                &[],
+                CTRL,
+                true,
+                &[],
+                (false, false, false),
+                &[cancel_down, cancel_up],
+            )),
+            [(VK_LCONTROL, true), (VK_CANCEL, true), (VK_CANCEL, false)]
+        );
+        // Release Ctrl.
+        assert_eq!(
+            pairs(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[],
+            )),
+            [(VK_LCONTROL, false)]
+        );
+
+        // 5. Orphaned key-up (without tracked press) for VK_APPS is ignored; unfocused drops keys.
+        let apps_up = RawSpecialKey {
+            vk: VK_APPS,
+            scan_code: resolve_special_scan_code(VK_APPS, 0),
+            extended: true,
+            pressed: false,
+        };
+        let apps_down = RawSpecialKey {
+            pressed: true,
+            ..apps_up
+        };
+        let mult_down = RawSpecialKey {
+            vk: VK_MULTIPLY,
+            scan_code: resolve_special_scan_code(VK_MULTIPLY, 0),
+            extended: false,
+            pressed: true,
+        };
+        assert_eq!(
+            pairs(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[apps_up],
+            )),
+            []
+        );
+        assert_eq!(
+            pairs(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                false,
+                &[],
+                (false, false, false),
+                &[apps_down, mult_down],
+            )),
+            []
+        );
+
+        // 6. Held VK_APPS & VK_MULTIPLY are released cleanly on focus loss (preserving scan codes).
+        f.synced_locks = Some((false, false, false));
+        assert_eq!(
+            key_tuples(frame_raw_special(
+                &mut f,
+                &[],
+                NONE,
+                true,
+                &[],
+                (false, false, false),
+                &[apps_down, mult_down],
+            )),
+            [(VK_APPS, 0x5D, true, true), (VK_MULTIPLY, 0x37, false, true)]
+        );
+        assert_eq!(
+            key_tuples(frame_raw_special(
+                &mut f,
+                &[Event::WindowFocused(false)],
+                NONE,
+                false,
+                &[],
+                (false, false, false),
+                &[],
+            )),
+            [
+                (VK_APPS, 0x5D, true, false),
+                (VK_MULTIPLY, 0x37, false, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn win32_wh_getmessage_hook_captures_special_keys_without_pm_noremove_dupes() {
+        use windows::core::w;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, PeekMessageW, PostMessageW, HWND_MESSAGE,
+            PM_NOREMOVE,
+        };
+
+        struct TestHwnd(HWND);
+        impl Drop for TestHwnd {
+            fn drop(&mut self) {
+                if !self.0 .0.is_null() {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                    }
+                }
+            }
+        }
+
+        fn lparam_key(scan: u16, extended: bool, up: bool) -> LPARAM {
+            let mut bits = 1usize | (usize::from(scan) << 16);
+            if extended {
+                bits |= 1 << 24;
+            }
+            if up {
+                bits |= (1 << 30) | (1 << 31);
+            }
+            LPARAM(bits as isize)
+        }
+
+        let captured = std::thread::spawn(|| {
+            let _ = take_captured_special_keys();
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("STATIC"),
+                    w!("flashdesk_hook_test"),
+                    Default::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    HWND_MESSAGE,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .expect("CreateWindowExW(HWND_MESSAGE) failed");
+            let _win_guard = TestHwnd(hwnd);
+
+            let guard = SpecialKeyHookGuard::install_for_current_thread()
+                .expect("SetWindowsHookExW(WH_GETMESSAGE) failed");
+
+            unsafe {
+                // Normal key 'A' should be ignored by the hook.
+                PostMessageW(hwnd, WM_KEYDOWN, WPARAM(0x41), lparam_key(0x1E, false, false))
+                    .unwrap();
+                // Windows PrintScreen: WM_KEYUP only with SysRq scan 0x54 -> normalized to 0x37.
+                PostMessageW(
+                    hwnd,
+                    WM_KEYUP,
+                    WPARAM(usize::from(VK_SNAPSHOT)),
+                    lparam_key(0x54, true, true),
+                )
+                .unwrap();
+                // Pause rapid pulse with zero scan code -> normalized to 0x45.
+                PostMessageW(
+                    hwnd,
+                    WM_KEYDOWN,
+                    WPARAM(usize::from(VK_PAUSE)),
+                    lparam_key(0, false, false),
+                )
+                .unwrap();
+                PostMessageW(
+                    hwnd,
+                    WM_KEYUP,
+                    WPARAM(usize::from(VK_PAUSE)),
+                    lparam_key(0, false, true),
+                )
+                .unwrap();
+                // Ctrl+Break -> VK_CANCEL.
+                PostMessageW(
+                    hwnd,
+                    WM_KEYDOWN,
+                    WPARAM(usize::from(VK_CANCEL)),
+                    lparam_key(0x46, true, false),
+                )
+                .unwrap();
+                PostMessageW(
+                    hwnd,
+                    WM_KEYUP,
+                    WPARAM(usize::from(VK_CANCEL)),
+                    lparam_key(0x46, true, true),
+                )
+                .unwrap();
+                // Apps & NumpadMultiply.
+                PostMessageW(
+                    hwnd,
+                    WM_KEYDOWN,
+                    WPARAM(usize::from(VK_APPS)),
+                    lparam_key(0x5D, true, false),
+                )
+                .unwrap();
+                PostMessageW(
+                    hwnd,
+                    WM_KEYUP,
+                    WPARAM(usize::from(VK_MULTIPLY)),
+                    lparam_key(0x37, false, true),
+                )
+                .unwrap();
+
+                // PM_NOREMOVE must NOT enqueue duplicates.
+                let mut msg = MSG::default();
+                for _ in 0..3 {
+                    let _ = PeekMessageW(&mut msg, hwnd, 0, 0, PM_NOREMOVE);
+                }
+                assert!(take_captured_special_keys().is_empty());
+
+                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {}
+            }
+            let first_batch = take_captured_special_keys();
+
+            // Unhook removes hook cleanly: subsequent messages produce zero captured events.
+            drop(guard);
+            unsafe {
+                PostMessageW(
+                    hwnd,
+                    WM_KEYUP,
+                    WPARAM(usize::from(VK_SNAPSHOT)),
+                    lparam_key(0x37, true, true),
+                )
+                .unwrap();
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {}
+            }
+            let after_unhook = take_captured_special_keys();
+            (first_batch, after_unhook)
+        })
+        .join()
+        .expect("hook test thread panicked");
+
+        assert!(captured.1.is_empty(), "hook kept firing after Drop");
+        assert_eq!(
+            captured.0,
+            vec![
+                RawSpecialKey {
+                    vk: VK_SNAPSHOT,
+                    scan_code: 0x37,
+                    extended: true,
+                    pressed: false,
+                },
+                RawSpecialKey {
+                    vk: VK_PAUSE,
+                    scan_code: 0x45,
+                    extended: false,
+                    pressed: true,
+                },
+                RawSpecialKey {
+                    vk: VK_PAUSE,
+                    scan_code: 0x45,
+                    extended: false,
+                    pressed: false,
+                },
+                RawSpecialKey {
+                    vk: VK_CANCEL,
+                    scan_code: 0x46,
+                    extended: true,
+                    pressed: true,
+                },
+                RawSpecialKey {
+                    vk: VK_CANCEL,
+                    scan_code: 0x46,
+                    extended: true,
+                    pressed: false,
+                },
+                RawSpecialKey {
+                    vk: VK_APPS,
+                    scan_code: 0x5D,
+                    extended: true,
+                    pressed: true,
+                },
+                RawSpecialKey {
+                    vk: VK_MULTIPLY,
+                    scan_code: 0x37,
+                    extended: false,
+                    pressed: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_combo_events_press_forward_and_release_reverse() {
+        let evs = remote_combo_events(&[(VK_LWIN, true), (VK_D, false)]);
+        assert_eq!(
+            key_tuples(evs),
+            vec![
+                (VK_LWIN, scan_code_for_vk(VK_LWIN), true, true),
+                (VK_D, scan_code_for_vk(VK_D), false, true),
+                (VK_D, scan_code_for_vk(VK_D), false, false),
+                (VK_LWIN, scan_code_for_vk(VK_LWIN), true, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_combo_releases_held_modifiers_before_sending_combo() {
+        let mut f = KeyForwarder::default();
+        f.synced_locks = Some((false, false, false));
+        let _ = frame(&mut f, &[], CTRL, &[]);
+        assert!(f.sent_mods.ctrl);
+
+        let mut combo = Vec::new();
+        f.combo_events(&[(VK_LWIN, true), (VK_D, false)], &mut combo);
+        assert_eq!(
+            pairs(combo),
+            vec![
+                (VK_LCONTROL, false),
+                (VK_LWIN, true),
+                (VK_D, true),
+                (VK_D, false),
+                (VK_LWIN, false),
+            ]
+        );
+        assert_eq!(f.sent_mods, NONE);
+    }
+
+    #[test]
+    fn copy_cut_paste_with_non_shortcut_physical_key_returns_none() {
+        assert_eq!(map_egui_key(Key::Copy, Some(Key::F13)), None);
+        assert_eq!(map_egui_key(Key::Cut, Some(Key::A)), None);
+        assert_eq!(map_egui_key(Key::Paste, Some(Key::B)), None);
+        // Physical keys matching actual clipboard shortcut keys still map cleanly.
+        assert_eq!(map_egui_key(Key::Copy, Some(Key::C)), Some((VK_C, false)));
+        assert_eq!(
+            map_egui_key(Key::Paste, Some(Key::Insert)),
+            Some((VK_INSERT, true))
+        );
+    }
+
+    #[test]
+    fn tools_menu_renders_within_250px_popover() {
+        let ctx = egui::Context::default();
+        theme::install(&ctx);
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(640.0, 440.0))),
+            ..Default::default()
+        };
+        let mut clipboard_enabled = true;
+        let mut scale_mode = ScaleMode::Fit;
+        let _ = ctx.run(raw, |ctx| {
+            egui::Area::new(egui::Id::new("test_tools_popover"))
+                .fixed_pos(pos2(10.0, 10.0))
+                .show(ctx, |ui| {
+                    ui.set_width(250.0);
+                    let _ = render_tools_menu_body(ui, &mut clipboard_enabled, &mut scale_mode);
+                    assert!(
+                        ui.min_rect().width() <= 252.0,
+                        "tools popover overflowed 250px: {}",
+                        ui.min_rect().width()
+                    );
+                });
+        });
     }
 
     fn test_entry(name: &str, path: &str, is_dir: bool) -> FileEntry {
