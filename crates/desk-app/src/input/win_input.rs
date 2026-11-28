@@ -1,17 +1,24 @@
 use protocol::session::{InputEvent, MonitorInfo, MouseBtn};
+use windows::Win32::Foundation::GetLastError;
 use windows::Win32::System::StationsAndDesktops::{GetThreadDesktop, SetThreadDesktop, HDESK};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, GetKeyboardState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD,
-    INPUT_MOUSE, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
-    MAPVK_VK_TO_VSC, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
-    MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
-    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
+    GetKeyState, MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MAPVK_VK_TO_VSC,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP, MOUSEINPUT, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
+
+#[link(name = "user32")]
+extern "system" {
+    #[link_name = "GetKeyboardState"]
+    fn raw_get_keyboard_state(lp_key_state: *mut u8) -> i32;
+}
 
 const XBUTTON1_DATA: u32 = 1;
 const XBUTTON2_DATA: u32 = 2;
@@ -106,14 +113,46 @@ pub fn inject_input(event: &InputEvent, target_monitor: Option<&MonitorInfo>, ag
             caps_lock,
             num_lock,
             scroll_lock,
-        } => sync_lock_keys_with(
-            (*caps_lock, *num_lock, *scroll_lock),
-            current_lock_states,
-            |inputs| {
-                let inserted = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
-                inserted == inputs.len() as u32
-            },
-        ),
+        } => {
+            let probe = probe_lock_states();
+            let desired = (*caps_lock, *num_lock, *scroll_lock);
+            let mut flips_count = 0usize;
+            let mut sent = 0u32;
+            let mut expected = 0u32;
+            let mut last_err = 0u32;
+            let ok = sync_lock_keys_with(
+                desired,
+                || probe.states,
+                |inputs| {
+                    flips_count = inputs.len() / 2;
+                    expected = inputs.len() as u32;
+                    sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+                    if sent != expected {
+                        last_err = unsafe { GetLastError().0 };
+                    }
+                    sent == expected
+                },
+            );
+            tracing::info!(
+                "host sync_lock_keys: desired=({},{},{}) cur=({},{},{}) gks=({},{},{}) kbd_ok={} set_desk_ok={} flips={} sent={}/{} err={}",
+                desired.0,
+                desired.1,
+                desired.2,
+                probe.states.0,
+                probe.states.1,
+                probe.states.2,
+                probe.gks_states.0,
+                probe.gks_states.1,
+                probe.gks_states.2,
+                probe.kbd_state_ok,
+                probe.set_desk_ok,
+                flips_count,
+                sent,
+                expected,
+                last_err,
+            );
+            ok
+        }
     }
 }
 
@@ -155,30 +194,48 @@ where
     send_inputs(&inputs)
 }
 
-fn read_lock_toggles_on_thread() -> (bool, bool, bool) {
-    let mut keys = [0u8; 256];
-    // GetKeyboardState issues NtUserGetKeyboardState directly rather than hitting
-    // user32!GetKeyState's Win32ClientInfo+0x874 cache (which covers vk < 0x20, incl. VK_CAPITAL).
-    if unsafe { GetKeyboardState(&mut keys) }.is_ok() {
-        return (
-            (keys[usize::from(VK_CAPITAL)] & 1) != 0,
-            (keys[usize::from(VK_NUMLOCK)] & 1) != 0,
-            (keys[usize::from(VK_SCROLL)] & 1) != 0,
-        );
-    }
-    unsafe {
+#[derive(Clone, Copy, Debug)]
+struct LockProbe {
+    states: (bool, bool, bool),
+    gks_states: (bool, bool, bool),
+    kbd_state_ok: bool,
+    set_desk_ok: bool,
+}
+
+/// Reads `(effective, gks, kbd_ok)` toggle states `(CapsLock, NumLock, ScrollLock)` for the active
+/// desktop using a true `*mut u8` `GetKeyboardState` FFI call.
+///
+/// Must NOT call `windows::Win32::UI::Input::KeyboardAndMouse::GetKeyboardState`: `windows 0.58.0`
+/// forwards `core::mem::transmute(lpkeystate.as_ptr())` derived from `&[u8; 256]`, which triggers
+/// LLVM `readonly` UB under `--release` (`opt-level = 3`) and constant-folds `keys` to all zeros.
+pub(crate) fn read_lock_toggles_raw() -> ((bool, bool, bool), (bool, bool, bool), bool) {
+    let gks = unsafe {
         (
             (GetKeyState(i32::from(VK_CAPITAL)) & 1) != 0,
             (GetKeyState(i32::from(VK_NUMLOCK)) & 1) != 0,
             (GetKeyState(i32::from(VK_SCROLL)) & 1) != 0,
         )
-    }
+    };
+    let mut keys = [0u8; 256];
+    // GetKeyboardState issues NtUserGetKeyboardState directly rather than hitting
+    // user32!GetKeyState's Win32ClientInfo+0x874 cache (which covers vk < 0x20, incl. VK_CAPITAL).
+    let kbd_ok = unsafe { raw_get_keyboard_state(keys.as_mut_ptr()) } != 0;
+    let effective = if kbd_ok {
+        (
+            (keys[usize::from(VK_CAPITAL)] & 1) != 0,
+            (keys[usize::from(VK_NUMLOCK)] & 1) != 0,
+            (keys[usize::from(VK_SCROLL)] & 1) != 0,
+        )
+    } else {
+        gks
+    };
+    (effective, gks, kbd_ok)
 }
 
 /// Reads the active desktop's lock-key toggle states without binding the long-lived, pump-less
 /// `flashdesk-host-input` thread to a stale `THREADINFO`/`pq->afKeyState` or blocking future
 /// `SetThreadDesktop` switches across `Default` <-> `Winlogon` in agent mode.
-fn current_lock_states() -> (bool, bool, bool) {
+fn probe_lock_states() -> LockProbe {
     let desk_raw = unsafe {
         GetThreadDesktop(GetCurrentThreadId())
             .ok()
@@ -188,15 +245,31 @@ fn current_lock_states() -> (bool, bool, bool) {
     let handle = std::thread::Builder::new()
         .name("flashdesk-lock-probe".into())
         .spawn(move || {
-            if desk_raw != 0 {
-                let _ = unsafe { SetThreadDesktop(HDESK(desk_raw as *mut _)) };
+            let set_desk_ok = if desk_raw != 0 {
+                unsafe { SetThreadDesktop(HDESK(desk_raw as *mut _)) }.is_ok()
+            } else {
+                true
+            };
+            let (states, gks_states, kbd_state_ok) = read_lock_toggles_raw();
+            LockProbe {
+                states,
+                gks_states,
+                kbd_state_ok,
+                set_desk_ok,
             }
-            read_lock_toggles_on_thread()
         });
-    match handle {
-        Ok(h) => h.join().unwrap_or_else(|_| read_lock_toggles_on_thread()),
-        Err(_) => read_lock_toggles_on_thread(),
-    }
+    handle
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_else(|| {
+            let (states, gks_states, kbd_state_ok) = read_lock_toggles_raw();
+            LockProbe {
+                states,
+                gks_states,
+                kbd_state_ok,
+                set_desk_ok: false,
+            }
+        })
 }
 
 fn lock_keys_to_toggle(
@@ -384,7 +457,7 @@ mod tests {
 
     #[test]
     fn current_lock_states_from_pumpless_thread_matches_live_and_preserves_set_thread_desktop() {
-        let baseline = std::thread::spawn(read_lock_toggles_on_thread)
+        let baseline = std::thread::spawn(|| read_lock_toggles_raw().0)
             .join()
             .expect("baseline probe panicked");
 
@@ -393,7 +466,7 @@ mod tests {
             .spawn(|| {
                 let mut results = Vec::new();
                 for _ in 0..3 {
-                    results.push(current_lock_states());
+                    results.push(probe_lock_states().states);
                 }
                 let set_ok = unsafe {
                     GetThreadDesktop(GetCurrentThreadId())
@@ -408,14 +481,32 @@ mod tests {
 
         assert!(
             set_desk_ok,
-            "current_lock_states must leave calling thread able to call SetThreadDesktop"
+            "probe_lock_states must leave calling thread able to call SetThreadDesktop"
         );
         assert_eq!(reads, vec![baseline, baseline, baseline]);
     }
 
     #[test]
+    fn probe_lock_states_reports_consistent_details_on_pumpless_thread() {
+        let probe = std::thread::Builder::new()
+            .name("flashdesk-probe-detail-test".into())
+            .spawn(probe_lock_states)
+            .expect("spawn failed")
+            .join()
+            .expect("probe thread panicked");
+        assert!(probe.set_desk_ok, "expected SetThreadDesktop check to pass");
+        assert!(probe.kbd_state_ok, "expected GetKeyboardState check to pass");
+        assert_eq!(probe.states, probe_lock_states().states);
+        assert_eq!(
+            probe.states,
+            probe.gks_states,
+            "GetKeyboardState must match GetKeyState on a fresh thread (catches windows-0.58 as_ptr readonly UB under opt-level=3)"
+        );
+    }
+
+    #[test]
     fn sync_lock_keys_noop_when_matching_live_state() {
-        let (caps, num, scroll) = current_lock_states();
+        let (caps, num, scroll) = probe_lock_states().states;
         assert!(inject_input(
             &InputEvent::SyncLockKeys {
                 caps_lock: caps,

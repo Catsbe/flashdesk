@@ -19,8 +19,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyState, MapVirtualKeyW, MAPVK_VK_TO_VSC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, MSG, PM_REMOVE,
-    WH_GETMESSAGE, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    CallNextHookEx, GetForegroundWindow, GetWindowThreadProcessId, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, MSG, PM_REMOVE, WH_GETMESSAGE, WM_KEYDOWN, WM_KEYUP,
+    WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -158,6 +159,7 @@ pub fn render_remote_view(
     // Always drain once per frame so keys typed while disconnected, waiting, overlaid, or
     // unfocused are discarded immediately instead of replaying once video resumes.
     let hook_specials = take_captured_special_keys();
+    let hook_lock_msgs = take_captured_lock_key_msgs();
 
     if let Some(frame) = session.latest_frame.lock().unwrap().take() {
         // Already converted to egui's pixel format on the decode thread: just upload.
@@ -222,6 +224,7 @@ pub fn render_remote_view(
                     &resp,
                     alive,
                     &hook_specials,
+                    &hook_lock_msgs,
                 );
             } else {
                 // 1:1 on a screen smaller than the remote desktop: pan with the scroll bars.
@@ -258,6 +261,7 @@ pub fn render_remote_view(
                             &resp,
                             alive,
                             &hook_specials,
+                            &hook_lock_msgs,
                         );
                     });
             }
@@ -516,6 +520,7 @@ fn present_video(
     resp: &egui::Response,
     alive: bool,
     special_keys: &[RawSpecialKey],
+    lock_key_msgs: &[(u16, bool)],
 ) {
     ui.painter().image(
         tex_id,
@@ -563,6 +568,7 @@ fn present_video(
             video_rect,
             pointer_in_video,
             special_keys,
+            lock_key_msgs,
         );
     }
 }
@@ -1971,8 +1977,13 @@ fn forward_inputs(
     video_rect: Rect,
     pointer_in_video: bool,
     special_keys: &[RawSpecialKey],
+    lock_key_msgs: &[(u16, bool)],
 ) {
     let mut events_to_send = Vec::new();
+    let (kbd_locks, gks_locks, kbd_ok) = read_viewer_lock_states();
+    let fg_owned = current_thread_owns_foreground();
+    let mut egui_focused = false;
+    let mut window_focused = false;
 
     ctx.input(|i| {
         if pointer_in_video {
@@ -2009,11 +2020,22 @@ fn forward_inputs(
         // change), for silent clipboard paste presses inferred without any key event.
         let held_now =
             |vk: u16| key_down(vk) && unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
-        let lock_toggled = |vk: u16| (unsafe { GetKeyState(i32::from(vk)) } & 1) != 0;
+        let lock_toggled = |vk: u16| match vk {
+            VK_CAPITAL => kbd_locks.0,
+            VK_NUMLOCK => kbd_locks.1,
+            VK_SCROLL => kbd_locks.2,
+            _ => (unsafe { GetKeyState(i32::from(vk)) } & 1) != 0,
+        };
+        egui_focused = i.focused;
+        let has_blur_ev = i
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::WindowFocused(false)));
+        window_focused = resolve_window_focused(egui_focused, fg_owned, has_blur_ev);
         // Sync lock-key states BEFORE forwarding any key presses from this frame.
         state
             .keys
-            .sync_locks(i.focused, &lock_toggled, &mut events_to_send);
+            .sync_locks(window_focused, &lock_toggled, &mut events_to_send);
         for (idx, ev) in i.events.iter().enumerate() {
             match ev {
                 Event::PointerButton {
@@ -2051,12 +2073,58 @@ fn forward_inputs(
         }
         state.keys.end_frame(
             i.modifiers,
-            i.focused,
+            window_focused,
             &held_now,
             special_keys,
             &mut events_to_send,
         );
     });
+
+    let mut emitted_sync = false;
+    for ev in &events_to_send {
+        if let InputEvent::SyncLockKeys {
+            caps_lock,
+            num_lock,
+            scroll_lock,
+        } = ev
+        {
+            emitted_sync = true;
+            tracing::info!(
+                "viewer sync_locks: sent=({},{},{}) kbd=({},{},{}) gks=({},{},{}) kbd_ok={} egui_focused={} fg_owned={} focused={} lock_msgs={:?}",
+                caps_lock,
+                num_lock,
+                scroll_lock,
+                kbd_locks.0,
+                kbd_locks.1,
+                kbd_locks.2,
+                gks_locks.0,
+                gks_locks.1,
+                gks_locks.2,
+                kbd_ok,
+                egui_focused,
+                fg_owned,
+                window_focused,
+                lock_key_msgs
+            );
+        }
+    }
+    if !emitted_sync && !lock_key_msgs.is_empty() {
+        tracing::info!(
+            "viewer lock_key_msg without sync: lock_msgs={:?} kbd=({},{},{}) gks=({},{},{}) kbd_ok={} egui_focused={} fg_owned={} focused={} synced_locks={:?}",
+            lock_key_msgs,
+            kbd_locks.0,
+            kbd_locks.1,
+            kbd_locks.2,
+            gks_locks.0,
+            gks_locks.1,
+            gks_locks.2,
+            kbd_ok,
+            egui_focused,
+            fg_owned,
+            window_focused,
+            state.keys.synced_locks
+        );
+    }
 
     for ev in events_to_send {
         session.send(ViewerCommand::Input(ev));
@@ -2144,8 +2212,27 @@ fn scan_code_for_vk(vk: u16) -> u16 {
     }
 }
 
+fn resolve_window_focused(egui_focused: bool, fg_owned: bool, has_blur_ev: bool) -> bool {
+    egui_focused || (fg_owned && !has_blur_ev)
+}
+
+fn current_thread_owns_foreground() -> bool {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        GetWindowThreadProcessId(fg, None) == GetCurrentThreadId()
+    }
+}
+
+fn read_viewer_lock_states() -> ((bool, bool, bool), (bool, bool, bool), bool) {
+    crate::input::win_input::read_lock_toggles_raw()
+}
+
 thread_local! {
     static SPECIAL_KEY_QUEUE: RefCell<Vec<RawSpecialKey>> = const { RefCell::new(Vec::new()) };
+    static LOCK_KEY_MSG_QUEUE: RefCell<Vec<(u16, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe extern "system" fn special_key_hook_proc(
@@ -2160,8 +2247,8 @@ unsafe extern "system" fn special_key_hook_proc(
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
         ) {
             let vk = (msg.wParam.0 & 0xFFFF) as u16;
+            let pressed = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
             if is_hooked_special_vk(vk) {
-                let pressed = matches!(msg.message, WM_KEYDOWN | WM_SYSKEYDOWN);
                 let msg_scan = (((msg.lParam.0 as usize) >> 16) & 0xFF) as u16;
                 let item = RawSpecialKey {
                     vk,
@@ -2173,6 +2260,15 @@ unsafe extern "system" fn special_key_hook_proc(
                     if let Ok(mut q) = cell.try_borrow_mut() {
                         if q.len() < 256 {
                             q.push(item);
+                        }
+                    }
+                });
+            } else if matches!(vk, VK_CAPITAL | VK_NUMLOCK | VK_SCROLL) {
+                // Capture lock-key messages solely for diagnostics; do not forward them as Key.
+                LOCK_KEY_MSG_QUEUE.with(|cell| {
+                    if let Ok(mut q) = cell.try_borrow_mut() {
+                        if q.len() < 64 {
+                            q.push((vk, pressed));
                         }
                     }
                 });
@@ -2219,12 +2315,24 @@ impl Drop for SpecialKeyHookGuard {
                     q.clear();
                 }
             });
+            LOCK_KEY_MSG_QUEUE.with(|cell| {
+                if let Ok(mut q) = cell.try_borrow_mut() {
+                    q.clear();
+                }
+            });
         }
     }
 }
 
 fn take_captured_special_keys() -> Vec<RawSpecialKey> {
     SPECIAL_KEY_QUEUE.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut q) => std::mem::take(&mut *q),
+        Err(_) => Vec::new(),
+    })
+}
+
+fn take_captured_lock_key_msgs() -> Vec<(u16, bool)> {
+    LOCK_KEY_MSG_QUEUE.with(|cell| match cell.try_borrow_mut() {
         Ok(mut q) => std::mem::take(&mut *q),
         Err(_) => Vec::new(),
     })
@@ -3757,5 +3865,24 @@ mod tests {
                 "popup should close after picking an item at {w}x{h}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_window_focused_recovers_stale_egui_focus_but_respects_blur() {
+        assert!(resolve_window_focused(false, true, false));
+        assert!(!resolve_window_focused(false, true, true));
+        assert!(!resolve_window_focused(false, false, false));
+        assert!(resolve_window_focused(true, false, false));
+    }
+
+    #[test]
+    fn viewer_lock_state_read_succeeds_without_panicking() {
+        let (eff, gks, kbd_ok) = read_viewer_lock_states();
+        assert!(kbd_ok, "expected GetKeyboardState to succeed on desktop thread");
+        assert_eq!(
+            eff,
+            gks,
+            "viewer GetKeyboardState must match GetKeyState on a fresh thread (catches windows-0.58 as_ptr readonly UB under opt-level=3)"
+        );
     }
 }
